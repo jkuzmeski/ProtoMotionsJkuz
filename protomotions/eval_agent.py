@@ -30,7 +30,6 @@ for arg in sys.argv:
 
 from lightning.fabric import Fabric  # noqa: E402
 from utils.config_utils import *  # noqa: E402, F403
-
 from protomotions.agents.ppo.agent import PPO  # noqa: E402
 
 
@@ -94,7 +93,14 @@ def main(override_config: OmegaConf):
     agent.setup()
     agent.load(config.checkpoint)
 
-    agent.evaluate_policy()
+    if config.checkpoint:
+        checkpoint_path = Path(config.checkpoint)
+        save_path = checkpoint_path.parent / "biomechanics"
+        save_path.mkdir(parents=True, exist_ok=True)
+    else:
+        save_path = None
+
+    agent.evaluate_policy(save_kinematics=True, save_path=save_path)
 
 
 if __name__ == "__main__":

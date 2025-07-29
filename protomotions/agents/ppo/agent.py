@@ -1,5 +1,6 @@
 import torch
 import logging
+import numpy as np
 
 from torch import Tensor
 
@@ -23,6 +24,7 @@ from protomotions.envs.base_env.env import BaseEnv
 from protomotions.utils.running_mean_std import RunningMeanStd
 from rich.progress import track
 from protomotions.agents.ppo.utils import discount_values, bounds_loss
+import pandas as pd
 
 log = logging.getLogger(__name__)
 
@@ -50,7 +52,7 @@ class PPO:
         if self.config.normalize_values:
             self.running_val_norm = RunningMeanStd(
                 shape=(1,),
-                device=self.device,
+                device=str(self.device),
                 clamp_value=self.config.normalized_val_clamp_value,
             )
         else:
@@ -154,9 +156,12 @@ class PPO:
 
     def save(self, path=None, name="last.ckpt", new_high_score=False):
         if path is None:
-            path = self.fabric.loggers[0].log_dir
-        root_dir = Path.cwd() / Path(self.fabric.loggers[0].root_dir)
-        save_dir = Path.cwd() / Path(path)
+            log_dir = self.fabric.loggers[0].log_dir
+            if log_dir is None:
+                raise ValueError("No log directory specified and no logger available.")
+            path = log_dir
+        root_dir = Path(self.fabric.loggers[0].root_dir)
+        save_dir = Path(path)
         state_dict = self.get_state_dict({})
         self.fabric.save(save_dir / name, state_dict)
 
@@ -177,8 +182,10 @@ class PPO:
         torch.save(env_state_dict, env_checkpoint)
 
         # Check if new high score flag is consistent across devices.
-        gathered_high_score = self.fabric.all_gather(new_high_score)
-        if hasattr(gathered_high_score, "tolist"):
+        gathered_high_score = self.fabric.all_gather(
+            torch.tensor(new_high_score, device=self.device)
+        )
+        if torch.is_tensor(gathered_high_score):
             gathered_high_score = gathered_high_score.tolist()
         if not isinstance(gathered_high_score, (list, tuple)):
             gathered_high_score = [gathered_high_score]
@@ -302,6 +309,8 @@ class PPO:
 
                 # After data collection, compute rewards, advantages, and returns.
                 rewards = self.experience_buffer.rewards
+                if not isinstance(rewards, torch.Tensor):
+                    raise TypeError(f"Expected rewards to be a Tensor, but got {type(rewards)}")
                 extra_rewards = self.calculate_extra_reward()
                 self.experience_buffer.batch_update_data("extra_rewards", extra_rewards)
                 total_rewards = rewards + extra_rewards
@@ -315,7 +324,10 @@ class PPO:
                     self.gamma,
                     self.tau,
                 )
-                returns = advantages + self.experience_buffer.values
+                values = self.experience_buffer.values
+                if not isinstance(values, torch.Tensor):
+                    raise TypeError(f"Expected values to be a Tensor, but got {type(values)}")
+                returns = advantages + values
                 self.experience_buffer.batch_update_data("returns", returns)
 
                 if self.config.normalize_advantage:
@@ -561,32 +573,65 @@ class PPO:
         return {}, None
 
     @torch.no_grad()
-    def evaluate_policy(self):
+    def evaluate_policy(self, save_kinematics: bool = False, save_path=None):
         self.eval()
         done_indices = None  # Force reset on first entry
         step = 0
+        if save_kinematics:
+            kinematics_data = []
+
         while self.config.max_eval_steps is None or step < self.config.max_eval_steps:
             obs = self.handle_reset(done_indices)
             # Obtain actor predictions
             actions = self.model.act(obs)
             # Step the environment
             obs, rewards, dones, terminated, extras = self.env_step(actions)
+            
+            if save_kinematics:
+                # Collect kinematics data
+                dof_pos = self.env.simulator.get_dof_state().dof_pos.cpu().numpy()
+                kinematics_data.append(dof_pos)
+
             all_done_indices = dones.nonzero(as_tuple=False)
             done_indices = all_done_indices.squeeze(-1)
             step += 1
+        
+        if save_kinematics:
+            # Save kinematics data to a CSV file
+            joint_names = self.env.simulator.robot_config.dof_names
+            # all_data will be shape (num_steps, num_envs, num_dofs)
+            all_data = np.array(kinematics_data)
+            # Reshape to get data per environment
+            num_envs = all_data.shape[1]
+            for i in range(num_envs):
+                # env_data is (num_steps, num_dofs)
+                env_data = all_data[:, i, :]
+                df = pd.DataFrame(env_data, columns=[str(name) for name in joint_names])
+                if save_path:
+                    filepath = save_path / f"kinematics_env_{i}.csv"
+                else:
+                    filepath = f"kinematics_env_{i}.csv"
+                df.to_csv(filepath, index=False)
+                print(f"Saved kinematics data to {filepath}")
 
     def post_epoch_logging(self, training_log_dict: Dict):
         end_time = time.time()
         log_dict = {
-            "info/episode_length": self.episode_length_meter.get_mean().item(),
-            "info/episode_reward": self.episode_reward_meter.get_mean().item(),
+            "info/episode_length": self.episode_length_meter.get_mean(),
+            "info/episode_reward": self.episode_reward_meter.get_mean(),
             "info/frames": torch.tensor(self.step_count),
             "info/gframes": torch.tensor(self.step_count / (10**9)),
             "times/fps_last_epoch": (self.num_steps * self.get_step_count_increment())
             / (end_time - self.epoch_start_time),
-            "times/fps_total": self.step_count / (end_time - self.fit_start_time),
-            "times/training_hours": (end_time - self.fit_start_time) / 3600,
-            "times/training_minutes": (end_time - self.fit_start_time) / 60,
+            "times/fps_total": self.step_count / (end_time - self.fit_start_time)
+            if self.fit_start_time
+            else 0,
+            "times/training_hours": (end_time - self.fit_start_time) / 3600
+            if self.fit_start_time
+            else 0,
+            "times/training_minutes": (end_time - self.fit_start_time) / 60
+            if self.fit_start_time
+            else 0,
             "times/last_epoch_seconds": (end_time - self.epoch_start_time),
             "rewards/task_rewards": self.experience_buffer.rewards.mean().item(),
             "rewards/extra_rewards": self.experience_buffer.extra_rewards.mean().item(),

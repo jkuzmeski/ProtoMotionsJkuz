@@ -1,6 +1,8 @@
 import torch
 import logging
 from pathlib import Path
+import pandas as pd
+import numpy as np
 
 from rich.progress import track
 
@@ -18,7 +20,9 @@ class Mimic(PPO):
     # -----------------------------
     # Motion Mapping and Data Distribution
     # -----------------------------
-    def map_motions_to_iterations(self) -> List[Tuple[torch.Tensor, torch.Tensor]]:
+    def map_motions_to_iterations(
+        self,
+    ) -> Tuple[List[Tuple[torch.Tensor, torch.Tensor]], int]:
         """
         Maps motion IDs to iterations for distributed processing.
 
@@ -27,9 +31,11 @@ class Mimic(PPO):
         motions across ranks and proper scene sampling.
 
         Returns:
-            List[Tuple[torch.Tensor, torch.Tensor]]: A list of tuples, each containing:
+            A tuple containing:
+            - A list of tuples, where each inner tuple contains:
                 - motion_ids: Tensor of motion IDs for an iteration.
                 - requires_scene: Tensor of booleans indicating if the motion requires a scene.
+            - The number of motions per rank.
         """
         world_size = self.fabric.world_size
         global_rank = self.fabric.global_rank
@@ -100,8 +106,10 @@ class Mimic(PPO):
                 max_iters = len(motion_map)
             else:
                 # Distributed: use all_gather
-                gathered_lengths = self.fabric.all_gather(len(motion_map))
-                if hasattr(gathered_lengths, 'tolist'):
+                gathered_lengths = self.fabric.all_gather(
+                    torch.tensor(len(motion_map), device=self.device)
+                )
+                if hasattr(gathered_lengths, "tolist"):
                     max_iters = max(gathered_lengths.tolist())
                 else:
                     max_iters = max(gathered_lengths)
@@ -128,6 +136,10 @@ class Mimic(PPO):
 
             dt: float = self.env.dt
             motion_lengths = self.motion_lib.get_motion_length(motion_ids)
+            if not isinstance(motion_lengths, torch.Tensor):
+                raise TypeError(
+                    f"Expected motion_lengths to be a Tensor, but got {type(motion_lengths)}"
+                )
             motion_num_frames = (motion_lengths / dt).floor().long()
 
             max_len = (
@@ -138,9 +150,12 @@ class Mimic(PPO):
 
             for eval_episode in range(self.config.eval_num_episodes):
                 # Sample random start time with slight noise for varied initial conditions.
-                elapsed_time = (
-                    torch.rand_like(self.motion_lib.state.motion_lengths[motion_ids]) * dt
-                )
+                motion_lengths = self.motion_lib.get_motion_length(motion_ids)
+                if not isinstance(motion_lengths, torch.Tensor):
+                    raise TypeError(
+                        f"Expected motion_lengths to be a Tensor, but got {type(motion_lengths)}"
+                    )
+                elapsed_time = torch.rand_like(motion_lengths) * dt
                 self.env.motion_manager.motion_times[:num_motions_this_iter] = elapsed_time
                 self.env.motion_manager.reset_track_steps.reset_steps(env_ids)
                 # Disable automatic reset to maintain consistency in evaluation.
@@ -151,7 +166,7 @@ class Mimic(PPO):
                     torch.arange(0, self.num_envs, dtype=torch.long, device=self.device)
                 )
 
-                for l in range(max_len):
+                for l in range(int(max_len)):
                     actions = self.model.act(obs)
                     obs, rewards, dones, terminated, extras = self.env_step(actions)
                     elapsed_time += dt
@@ -177,7 +192,13 @@ class Mimic(PPO):
         print("Evaluation done, now aggregating data.")
 
         if self.env.config.motion_manager.fixed_motion_id is None:
-            motion_lengths = self.motion_lib.state.motion_lengths[:]
+            motion_lengths = self.motion_lib.get_motion_length(
+                torch.arange(self.motion_lib.num_motions(), device=self.device)
+            )
+            if not isinstance(motion_lengths, torch.Tensor):
+                raise TypeError(
+                    f"Expected motion_lengths to be a Tensor, but got {type(motion_lengths)}"
+                )
             motion_num_frames = (motion_lengths / dt).floor().long()
 
         # Save metrics per rank; distributed all_gather does not support dictionaries.
@@ -250,3 +271,104 @@ class Mimic(PPO):
         self.force_full_restart = True
 
         return to_log, to_log.get("eval/tracking_success_rate", to_log.get("eval/cartesian_err", None))
+
+    @torch.no_grad()
+    def evaluate_policy(self, save_kinematics: bool = False, save_path=None):
+        self.eval()
+        motion_map, remaining_motions = self.map_motions_to_iterations()
+        num_outer_iters = len(motion_map)
+
+        if len(motion_map) == 0:
+            max_iters = 0
+        else:
+            if self.fabric.world_size == 1:
+                max_iters = len(motion_map)
+            else:
+                gathered_lengths = self.fabric.all_gather(torch.tensor(len(motion_map), device=self.device))
+                if hasattr(gathered_lengths, "tolist"):
+                    max_iters = max(gathered_lengths.tolist())
+                else:
+                    max_iters = max(gathered_lengths)
+
+        for outer_iter in track(
+            range(max_iters),
+            description=f"Evaluating... {remaining_motions} motions remain...",
+        ):
+            if outer_iter >= len(motion_map):
+                continue
+
+            motion_pointer = outer_iter % num_outer_iters
+            motion_ids, requires_scene = motion_map[motion_pointer]
+            num_motions_this_iter = len(motion_ids)
+
+            self.env.agent_in_scene[:] = False
+            self.env.motion_manager.motion_ids[:num_motions_this_iter] = motion_ids
+            self.env.agent_in_scene[:num_motions_this_iter] = requires_scene
+            self.env.force_respawn_on_flat = True
+
+            env_ids = torch.arange(
+                0, num_motions_this_iter, dtype=torch.long, device=self.device
+            )
+
+            dt: float = self.env.dt
+            motion_lengths = self.motion_lib.get_motion_length(motion_ids)
+            if not isinstance(motion_lengths, torch.Tensor):
+                raise TypeError(
+                    f"Expected motion_lengths to be a Tensor, but got {type(motion_lengths)}"
+                )
+            motion_num_frames = (motion_lengths / dt).floor().long()
+
+            max_len = (
+                motion_num_frames.max().item()
+                if self.config.eval_length is None
+                else self.config.eval_length
+            )
+
+            kinematics_data = {i: [] for i in range(num_motions_this_iter)}
+
+            for eval_episode in range(self.config.eval_num_episodes):
+                motion_lengths = self.motion_lib.get_motion_length(motion_ids)
+                if not isinstance(motion_lengths, torch.Tensor):
+                    raise TypeError(
+                        f"Expected motion_lengths to be a Tensor, but got {type(motion_lengths)}"
+                    )
+                elapsed_time = torch.rand_like(motion_lengths) * dt
+                self.env.motion_manager.motion_times[:num_motions_this_iter] = elapsed_time
+                self.env.motion_manager.reset_track_steps.reset_steps(env_ids)
+                self.env.disable_reset = True
+                self.env.motion_manager.disable_reset_track = True
+
+                obs = self.env.reset(
+                    torch.arange(0, self.num_envs, dtype=torch.long, device=self.device)
+                )
+
+                for l in range(int(max_len)):
+                    actions = self.model.act(obs)
+                    obs, rewards, dones, terminated, extras = self.env_step(actions)
+                    elapsed_time += dt
+
+                    if save_kinematics:
+                        dof_pos = self.env.simulator.get_dof_state().dof_pos.cpu().numpy()
+                        for i in range(num_motions_this_iter):
+                            kinematics_data[i].append(dof_pos[i])
+
+            if save_kinematics:
+                joint_names = self.env.simulator.robot_config.dof_names
+                for i in range(num_motions_this_iter):
+                    motion_id = motion_ids[i].item()
+                    env_data = np.array(kinematics_data[i])
+                    df = pd.DataFrame(env_data, columns=joint_names)
+                    if save_path:
+                        filepath = save_path / f"kinematics_motion_{motion_id}.csv"
+                    else:
+                        filepath = f"kinematics_motion_{motion_id}.csv"
+                    df.to_csv(filepath, index=False)
+                    print(f"Saved kinematics data to {filepath}")
+
+        self.env.disable_reset = False
+        self.env.motion_manager.disable_reset_track = False
+        self.env.force_respawn_on_flat = False
+
+        all_ids = torch.arange(0, self.num_envs, dtype=torch.long, device=self.device)
+        self.env.motion_manager.reset_envs(all_ids)
+        self.force_full_restart = True
