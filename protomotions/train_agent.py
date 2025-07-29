@@ -9,6 +9,7 @@ from pathlib import Path
 import logging
 import hydra
 from hydra.utils import instantiate
+from omegaconf import OmegaConf
 
 has_robot_arg = False
 simulator = None
@@ -33,6 +34,7 @@ import wandb  # noqa: E402
 from lightning.pytorch.loggers import WandbLogger  # noqa: E402
 import torch  # noqa: E402
 from lightning.fabric import Fabric  # noqa: E402
+from omegaconf import OmegaConf  # noqa: E402
 from utils.config_utils import *  # noqa: E402, F403
 from utils.common import seeding  # noqa: E402, F403
 
@@ -78,6 +80,7 @@ def main(config: OmegaConf):
     if simulator == "isaaclab":
         app_launcher_flags = {
             "headless": config.headless,
+            "enable_cameras": True,  # Enable cameras to ensure proper rendering pipeline is loaded
         }
         if fabric.world_size > 1:
             # This is needed when running with SLURM.

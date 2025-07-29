@@ -96,7 +96,8 @@ class MotionLib(DeviceDtypeModuleMixin):
 
         self.register_buffer(
             "key_body_ids",
-            torch.tensor(key_body_ids, dtype=torch.long, device=device),
+            key_body_ids.detach().clone() if hasattr(key_body_ids, 'detach') 
+            else torch.tensor(key_body_ids, dtype=torch.long, device=device),
             persistent=False,
         )
 
@@ -454,7 +455,7 @@ class MotionLib(DeviceDtypeModuleMixin):
             cur_fps = full_motion_fpses[motion_f]
             if cur_fps is None:
                 cur_fps = curr_motion.fps
-                
+
             if cur_fps > target_frame_rate:
                 # Not necessary, but we downsample the FPS to save memory
                 # do nothing if cur_fps <= target_frame_rate

@@ -7,7 +7,8 @@ fabric:
   devices: ${ngpu}
   num_nodes: ${nodes}
   strategy:
-    _target_: lightning.fabric.strategies.DDPStrategy
+    _target_: lightning.fabric.strategies.SingleDeviceStrategy
+    device: cuda:0
   precision: ${amp_precision}
   loggers:
     - _target_: lightning.fabric.loggers.TensorBoardLogger

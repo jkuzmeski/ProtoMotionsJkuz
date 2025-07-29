@@ -34,7 +34,7 @@ from utils.config_utils import *  # noqa: E402, F403
 from protomotions.agents.ppo.agent import PPO  # noqa: E402
 
 
-@hydra.main(config_path="config")
+@hydra.main(config_path="config", version_base=None)
 def main(override_config: OmegaConf):
     os.chdir(hydra.utils.get_original_cwd())
 
@@ -80,7 +80,9 @@ def main(override_config: OmegaConf):
     fabric.launch()
 
     if simulator == "isaaclab":
-        app_launcher = AppLauncher({"headless": config.headless})
+        # Enable cameras to ensure proper rendering pipeline is loaded
+        # This is needed even if no cameras are used, as it enables the rendering extensions
+        app_launcher = AppLauncher({"headless": config.headless, "enable_cameras": True})
         simulation_app = app_launcher.app
         env = instantiate(
             config.env, device=fabric.device, simulation_app=simulation_app

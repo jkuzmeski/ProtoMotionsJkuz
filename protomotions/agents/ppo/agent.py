@@ -1,11 +1,11 @@
 import torch
-import os
 import logging
 
 from torch import Tensor
 
 import time
 import math
+import shutil
 from pathlib import Path
 from typing import Optional, Tuple, Dict
 
@@ -162,12 +162,11 @@ class PPO:
 
         if self.fabric.global_rank == 0:
             if root_dir != save_dir:
-                if (root_dir / "last.ckpt").is_symlink():
+                # On Windows, use file copy instead of symlink to avoid privilege issues
+                if (root_dir / "last.ckpt").exists():
                     (root_dir / "last.ckpt").unlink()
-                # Make root_dir / "last.ckpt" point to the new checkpoint.
-                # Calculate the relative path and create a symbolic link.
-                relative_path = Path(os.path.relpath(save_dir / name, root_dir))
-                (root_dir / "last.ckpt").symlink_to(relative_path)
+                # Copy the checkpoint file instead of creating a symlink
+                shutil.copy2(save_dir / name, root_dir / "last.ckpt")
                 log.info(f"saved checkpoint, {root_dir / 'last.ckpt'}")
         self.fabric.barrier()
         
@@ -179,8 +178,12 @@ class PPO:
 
         # Check if new high score flag is consistent across devices.
         gathered_high_score = self.fabric.all_gather(new_high_score)
+        if hasattr(gathered_high_score, "tolist"):
+            gathered_high_score = gathered_high_score.tolist()
+        if not isinstance(gathered_high_score, (list, tuple)):
+            gathered_high_score = [gathered_high_score]
         assert all(
-            [x == gathered_high_score[0] for x in gathered_high_score]
+            x == gathered_high_score[0] for x in gathered_high_score
         ), "New high score flag should be the same across all ranks."
 
         if new_high_score:
@@ -191,11 +194,11 @@ class PPO:
             )
             if self.fabric.global_rank == 0:
                 if root_dir != save_dir:
-                    if (root_dir / "score_based.ckpt").is_symlink():
+                    # On Windows, use file copy instead of symlink to avoid privilege issues
+                    if (root_dir / "score_based.ckpt").exists():
                         (root_dir / "score_based.ckpt").unlink()
-                    # Create symlink for the best score checkpoint.
-                    relative_path = Path(os.path.relpath(save_dir / name, root_dir))
-                    (root_dir / "score_based.ckpt").symlink_to(relative_path)
+                    # Copy the score-based checkpoint file instead of creating a symlink
+                    shutil.copy2(save_dir / score_based_name, root_dir / "score_based.ckpt")
 
     # -----------------------------
     # Experience Buffer and Training Loop

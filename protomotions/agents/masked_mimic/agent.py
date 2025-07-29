@@ -490,7 +490,21 @@ class MaskedMimic(PPO):
         motion_map, remaining_motions = self.map_motions_to_iterations()
         num_outer_iters = len(motion_map)
         # Maximal number of iters any of the ranks needs to perform.
-        max_iters = max(self.fabric.all_gather(len(motion_map)))
+        # Handle case where motion_map might be empty (when num_motions < world_size)
+        if len(motion_map) == 0:
+            max_iters = 0
+        else:
+            # Handle both single-device and distributed scenarios
+            if self.fabric.world_size == 1:
+                # Single device: no need for all_gather
+                max_iters = len(motion_map)
+            else:
+                # Distributed: use all_gather
+                gathered_lengths = self.fabric.all_gather(len(motion_map))
+                if hasattr(gathered_lengths, 'tolist'):
+                    max_iters = max(gathered_lengths.tolist())
+                else:
+                    max_iters = max(gathered_lengths)
         vae_noise = torch.zeros(self.num_envs, self.config.model.config.vae_latent_dim, device=self.device, dtype=torch.float)
 
         for outer_iter in track(
