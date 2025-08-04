@@ -6,6 +6,7 @@ from typing import Sequence
 import torch
 from scipy.spatial.transform import Rotation as sRot
 import uuid
+import torch
 
 import mujoco
 import mujoco.viewer
@@ -83,9 +84,22 @@ _G1_KEYPOINT_TO_JOINT = {
     "R_Shoulder": {"name": "right_shoulder_pitch_link", "weight": 1.0},
 }
 
+_SMPL_HUMANOID_LOWER_BODY_KEYPOINT_TO_JOINT = {
+    "Pelvis":    {"name": "Pelvis", "weight": 1.0},
+    "L_Hip":     {"name": "L_Hip", "weight": 1.5},
+    "R_Hip":     {"name": "R_Hip", "weight": 1.5},
+    "L_Knee":    {"name": "L_Knee", "weight": 2.0},
+    "R_Knee":    {"name": "R_Knee", "weight": 2.0},
+    "L_Ankle":   {"name": "L_Ankle", "weight": 3.0},
+    "R_Ankle":   {"name": "R_Ankle", "weight": 3.0},
+    "L_Toe":     {"name": "L_Toe", "weight": 3.0},
+    "R_Toe":     {"name": "R_Toe", "weight": 3.0},
+}
+
 _KEYPOINT_TO_JOINT_MAP = {
     "h1": _H1_KEYPOINT_TO_JOINT,
     "g1": _G1_KEYPOINT_TO_JOINT,
+    "smpl_humanoid_lower_body": _SMPL_HUMANOID_LOWER_BODY_KEYPOINT_TO_JOINT,
 }
 
 _RESCALE_FACTOR = {
@@ -100,6 +114,7 @@ _OFFSET = {
 _ROOT_LINK = {
     "h1": "pelvis",
     "g1": "pelvis",
+    "smpl_humanoid_lower_body": "pelvis",
 }
 
 _H1_VELOCITY_LIMITS = {
@@ -213,6 +228,8 @@ def construct_model(robot_name: str, keypoint_names: Sequence[str]):
         humanoid_mjcf = mjcf.from_path("protomotions/data/assets/mjcf/h1.xml")
     elif robot_name == "g1":
         humanoid_mjcf = mjcf.from_path("protomotions/data/assets/mjcf/g1.xml")
+    elif robot_name == "smpl_humanoid_lower_body":
+        humanoid_mjcf = mjcf.from_path("protomotions/data/assets/mjcf/smpl_humanoid_lower_body.xml")
     else:
         raise ValueError(f"Unknown robot name: {robot_name}")
     humanoid_mjcf.worldbody.add(
@@ -597,125 +614,82 @@ def retarget_motion(motion: SkeletonMotion, robot_type: str, render: bool = Fals
     return retargeted_motion
 
 
-def manually_retarget_motion(
-    amass_data: str, output_path: str, robot_type: str, render: bool = False
-):
-    # Store retargeted motion data
-    motion_data = dict(np.load(open(amass_data, "rb"), allow_pickle=True))
+def create_motion_from_txt(filepath: str, treadmill_speed: float, mocap_fr: int = 200):  # Assuming 100Hz from C3D
+    """
+    Loads joint center data from your specific .txt file format
+    and creates a SkeletonMotion object.
+    """
+    # 1. Load your raw data, skipping the text header
+    print(f"Loading data from {filepath}...")
+    # Use skiprows=5 to ignore the header lines in your specific file
+    raw_data = np.loadtxt(filepath, skiprows=5)
+    
+    # The first column is the frame number, so we skip it with [:, 1:]
+    num_frames = raw_data.shape[0]
+    num_joints = (raw_data.shape[1] - 1) // 3
+    print(f"Loaded {num_frames} frames for {num_joints} joints.")
+    
+    # Reshape the data to (num_frames, num_joints, 3)
+    joint_centers = raw_data[:, 1:].reshape((num_frames, num_joints, 3))
 
-    mujoco_joint_names = SMPLH_MUJOCO_NAMES
-    joint_names = SMPLH_BONE_ORDER_NAMES
+    # The data seems to be in millimeters, convert to meters
+    joint_centers /= 1000.0
 
-    betas = motion_data["betas"]
-    gender = motion_data["gender"]
-    amass_pose = motion_data["poses"]
-    amass_trans = motion_data["trans"]
-    if "mocap_framerate" in motion_data:
-        mocap_fr = motion_data["mocap_framerate"]
-    else:
-        mocap_fr = motion_data["mocap_frame_rate"]
+    # 2. Add treadmill velocity to the root (pelvis)
+    # Your data file is S02_3-0ms, which suggests 3.0 m/s
+    time_steps = np.arange(num_frames) / mocap_fr
+    joint_centers[:, 0, 0] += treadmill_speed * time_steps  # Assuming treadmill on X-axis
 
-    skip = int(mocap_fr // 30)
+    # 3. Create a basic SkeletonTree for the IK target
+    joint_names = ["Pelvis", "L_Hip", "L_Knee", "L_Ankle", "L_Toe", "R_Hip", "R_Knee", "R_Ankle", "R_Toe"]
+    parents = [-1, 0, 1, 2, 3, 0, 5, 6, 7] # Simple chain hierarchy
+    skeleton_tree = SkeletonTree(parents, joint_names)
 
-    pose_aa = torch.tensor(amass_pose[::skip])
-    amass_trans = torch.tensor(amass_trans[::skip])
-    betas = torch.from_numpy(betas)
-
-    betas[:] = 0
-
-    motion_data = {
-        "pose_aa": pose_aa.numpy(),
-        "trans": amass_trans.numpy(),
-        "beta": betas.numpy(),
-    }
-
-    smpl_2_mujoco = [
-        joint_names.index(q) for q in mujoco_joint_names if q in joint_names
-    ]
-    batch_size = motion_data["pose_aa"].shape[0]
-
-    pose_aa = np.concatenate(
-        [
-            motion_data["pose_aa"][:, :66],
-            motion_data["pose_aa"][:, 75:],
-        ],
-        axis=-1,
-    )
-    pose_aa_mj = pose_aa.reshape(batch_size, 52, 3)[:, smpl_2_mujoco]
-    pose_quat = (
-        sRot.from_rotvec(pose_aa_mj.reshape(-1, 3)).as_quat().reshape(batch_size, 52, 4)
-    )
-
-    robot_cfg = {
-        "mesh": False,
-        "rel_joint_lm": True,
-        "upright_start": True,
-        "remove_toe": False,
-        "real_weight": True,
-        "real_weight_porpotion_capsules": True,
-        "real_weight_porpotion_boxes": True,
-        "replace_feet": True,
-        "masterfoot": False,
-        "big_ankle": True,
-        "freeze_hand": False,
-        "box_body": False,
-        "master_range": 50,
-        "body_params": {},
-        "joint_params": {},
-        "geom_params": {},
-        "actuator_params": {},
-        "model": "smplx",
-        "sim": "isaacgym",
-    }
-
-    smpl_local_robot = SMPL_Robot(
-        robot_cfg,
-        data_dir="data/smpl",
-    )
-
-    smpl_local_robot.load_from_skeleton(betas=betas[None,], gender=[0], objs_info=None)
-    TMP_SMPL_DIR = "/tmp/smpl"
-    uuid_str = uuid.uuid4()
-    smpl_local_robot.write_xml(f"{TMP_SMPL_DIR}/smpl_humanoid_{uuid_str}.xml")
-    skeleton_tree = SkeletonTree.from_mjcf(
-        f"{TMP_SMPL_DIR}/smpl_humanoid_{uuid_str}.xml"
-    )
-
-    root_trans_offset = (
-        torch.from_numpy(motion_data["trans"]) + skeleton_tree.local_translation[0]
-    )
+    # 4. Create a SkeletonState with placeholder rotations
+    # The IK solver only needs the target *positions*, so we can use identity rotations.
+    identity_rotations = np.zeros((num_frames, num_joints, 4))
+    identity_rotations[..., 3] = 1.0  # w=1 for identity quaternion
 
     sk_state = SkeletonState.from_rotation_and_root_translation(
-        skeleton_tree,  # This is the wrong skeleton tree (location wise) here, but it's fine since we only use the parent relationship here.
-        torch.from_numpy(pose_quat),
-        root_trans_offset,
+        skeleton_tree,
+        torch.from_numpy(identity_rotations).float(),
+        torch.from_numpy(joint_centers[:, 0, :]).float(),  # Root is the pelvis
         is_local=True,
     )
+    
+    # IMPORTANT: Override the global translation with your precise joint center data
+    sk_state.global_translation = torch.from_numpy(joint_centers).float()
+    
+    print("SkeletonMotion object created successfully.")
+    return SkeletonMotion.from_skeleton_state(sk_state, fps=mocap_fr)
 
-    timeseries_length = pose_aa.shape[0]
-    pose_quat_global = (
-        (
-            sRot.from_quat(sk_state.global_rotation.reshape(-1, 4).numpy())
-            * sRot.from_quat([0.5, 0.5, 0.5, 0.5]).inv()
-        )
-        .as_quat()
-        .reshape(timeseries_length, -1, 4)
-    )
 
-    trans = root_trans_offset.clone()
-    new_sk_state = SkeletonState.from_rotation_and_root_translation(
-        skeleton_tree,
-        torch.from_numpy(pose_quat_global),
-        trans,
-        is_local=False,
-    )
-    new_sk_motion = SkeletonMotion.from_skeleton_state(new_sk_state, fps=30)
+# --- MODIFY THE MAIN RETARGETING FUNCTION ---
+def manually_retarget_motion(
+    # Change the input from amass_data to your file path
+    your_data_path: str, 
+    output_path: str, 
+    robot_type: str, 
+    # Add treadmill speed as a parameter
+    treadmill_speed: float = 1.5,
+    render: bool = False
+):
+    # 1. CREATE THE MOTION OBJECT FROM YOUR TXT FILE
+    # This replaces all the AMASS loading and processing logic
+    print("Loading motion from your .txt file...")
+    new_sk_motion = create_motion_from_txt(your_data_path, treadmill_speed)
+    
+    # 2. RUN THE RETARGETING
+    # The rest of the pipeline remains the same!
+    print("Starting retargeting process...")
     sk_motion = retarget_motion(new_sk_motion, robot_type, render=render)
-    if robot_type in ["h1", "g1"]:
-        torch.save(sk_motion, output_path)
-    else:
-        sk_motion.to_file(output_path)
+
+    # 3. SAVE THE OUTPUT
+    # For a custom robot, it's safest to save as a generic .npy file
+    print(f"Saving retargeted motion to {output_path}")
+    sk_motion.to_file(output_path)
 
 
 if __name__ == "__main__":
+    # Update to call your modified function
     typer.run(manually_retarget_motion)

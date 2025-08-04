@@ -555,11 +555,20 @@ class BaseEnv:
 
         termination_heights = np.array([termination_height] * self.simulator.robot_config.num_bodies)
 
-        head_id = self.config.robot.body_names.index(self.config.robot.head_body_name)
-
-        termination_heights[head_id] = max(
-            head_term_height, termination_heights[head_id]
-        )
+        # Set termination height for head or pelvis if no head
+        if self.config.robot.head_body_name is not None:
+            # Use head if available
+            termination_body_name = self.config.robot.head_body_name
+        else:
+            # Use pelvis if no head (typically the first body in the list)
+            termination_body_name = "Pelvis"
+        
+        # Find the termination body in the body names list
+        if termination_body_name in self.config.robot.body_names:
+            termination_body_id = self.config.robot.body_names.index(termination_body_name)
+            termination_heights[termination_body_id] = max(
+                head_term_height, termination_heights[termination_body_id]
+            )
 
         self.termination_heights = torch_utils.to_torch(
             termination_heights, device=self.device

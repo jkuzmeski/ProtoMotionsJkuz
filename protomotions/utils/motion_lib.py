@@ -103,6 +103,7 @@ class MotionLib(DeviceDtypeModuleMixin):
 
         if str(motion_file).split(".")[-1] in ["yaml", "npy", "npz", "np"]:
             print("Loading motions from yaml/npy file")
+            print(f"Motion file path: {motion_file}")
             self._load_motions(motion_file, target_frame_rate)
         else:
             rank = _get_rank()
@@ -266,17 +267,29 @@ class MotionLib(DeviceDtypeModuleMixin):
     def get_motion_state(
             self, motion_ids, motion_times, joint_3d_format="exp_map"
     ) -> RobotState:
+        # Debug prints to track motion data flow
+        print("\n=== DEBUG: MotionLib.get_motion_state ===")
+        print(f"motion_ids: {motion_ids}")
+        print(f"motion_times: {motion_times}")
+        print(f"joint_3d_format: {joint_3d_format}")
+        
         motion_len = self.state.motion_lengths[motion_ids]
+        print(f"motion_len: {motion_len}")
+        
         motion_times = motion_times.clip(min=0).clip(
             max=motion_len
         )  # Making sure time is in bounds
+        print(f"clipped motion_times: {motion_times}")
 
         num_frames = self.state.motion_num_frames[motion_ids]
         dt = self.state.motion_dt[motion_ids]
+        print(f"num_frames: {num_frames}")
+        print(f"dt: {dt}")
 
         frame_idx0, frame_idx1, blend = self._calc_frame_blend(
             motion_times, motion_len, num_frames, dt
         )
+        print(f"frame_idx0: {frame_idx0}, frame_idx1: {frame_idx1}, blend: {blend}")
 
         f0l = frame_idx0 + self.length_starts[motion_ids]
         f1l = frame_idx1 + self.length_starts[motion_ids]
@@ -349,6 +362,15 @@ class MotionLib(DeviceDtypeModuleMixin):
         blend_exp = blend.unsqueeze(-1)
         key_body_pos = (1.0 - blend_exp) * key_body_pos0 + blend_exp * key_body_pos1
         key_body_pos[:, :, 2] += self.ref_height_adjust
+        
+        # Debug prints for motion data values
+        print(f"root_pos0 shape: {root_pos0.shape}, values: {root_pos0}")
+        print(f"root_pos1 shape: {root_pos1.shape}, values: {root_pos1}")
+        print(f"root_pos shape: {root_pos.shape}, values: {root_pos}")
+        print(f"root_rot0 shape: {root_rot0.shape}, values: {root_rot0}")
+        print(f"root_rot1 shape: {root_rot1.shape}, values: {root_rot1}")
+        print(f"root_rot shape: {root_rot.shape}, values: {root_rot}")
+        print(f"key_body_pos shape: {key_body_pos.shape}, values: {key_body_pos}")
 
         if hasattr(self, "dof_pos"):  # H1 joints
             dof_pos = (1.0 - blend) * self.dof_pos[f0l] + blend * self.dof_pos[f1l]
@@ -383,6 +405,14 @@ class MotionLib(DeviceDtypeModuleMixin):
             rigid_body_ang_vel=global_ang_vel,
         )
 
+        # Debug print final motion state
+        print("Final motion_state:")
+        print(f"  root_pos: {motion_state.root_pos}")
+        print(f"  root_rot: {motion_state.root_rot}")
+        print(f"  dof_pos: {motion_state.dof_pos}")
+        print(f"  dof_vel: {motion_state.dof_vel}")
+        print(f"  key_body_pos: {motion_state.key_body_pos}")
+
         return motion_state
 
     @staticmethod
@@ -398,9 +428,7 @@ class MotionLib(DeviceDtypeModuleMixin):
         else:
             end_frame = int(end * motion.fps)
 
-        assert (
-                start_frame < end_frame
-        ), f"Motion start frame {start_frame} >= motion end frame {end_frame}"
+        assert (start_frame < end_frame), f"Motion start frame {start_frame} >= motion end frame {end_frame}"
 
         sliced_local_rotation = motion.local_rotation[start_frame:end_frame].clone()
         sliced_root_translation = motion.root_translation[start_frame:end_frame].clone()
@@ -709,9 +737,7 @@ class MotionLib(DeviceDtypeModuleMixin):
                 elif configured_joint_axis == "z":
                     joint_axis[..., 2]
 
-                joint_theta = (
-                        joint_theta * joint_axis
-                )
+                joint_theta = (joint_theta * joint_axis)
 
                 joint_theta = rotations.normalize_angle(joint_theta)
                 dof_pos[:, joint_offset] = joint_theta

@@ -4,7 +4,7 @@ from easydict import EasyDict
 
 
 def h1_mapping():
-    #### Config for extension
+    # Config for extension
     extend_config = [
         {
             "joint_name": "left_arm_end_effector",
@@ -73,10 +73,10 @@ def h1_mapping():
         smpl_pose_modifier=smpl_pose_modifier,
         asset_file=asset_file,
     )
-    
+
 
 def g1_mapping():
-    #### Config for extension
+    # Config for extension
     extend_config = [
         {
             "joint_name": "left_rubber_hand_2",
@@ -136,7 +136,7 @@ def g1_mapping():
 
 
 def h1_no_head_mapping():
-    #### Config for extension
+    # Config for extension
     extend_config = [
         {
             "joint_name": "left_arm_end_effector",
@@ -189,7 +189,7 @@ def h1_no_head_mapping():
 
 
 def h1_no_head_no_hands_mapping():
-    #### Config for extension
+    # Config for extension
     extend_config = []
 
     base_link = "torso_link"
@@ -227,7 +227,7 @@ def h1_no_head_no_hands_mapping():
 
 
 def smplx_with_limits_mapping():
-    #### Config for extension
+    # Config for extension
     extend_config = []
 
     base_link = "Pelvis"
@@ -301,6 +301,30 @@ def smplx_with_limits_mapping():
     )
 
 
+def smpl_lower_body_mapping():
+    base_link = "Pelvis"
+    joint_matches = [
+        ["Pelvis", "Pelvis"],
+        ["L_Hip", "L_Hip"],
+        ["L_Knee", "L_Knee"],
+        ["L_Ankle", "L_Ankle"],
+        ["L_Toe", "L_Toe"],
+        ["R_Hip", "R_Hip"],
+        ["R_Knee", "R_Knee"],
+        ["R_Ankle", "R_Ankle"],
+        ["R_Toe", "R_Toe"],
+    ]
+    asset_file = "protomotions/data/assets/mjcf/smpl_humanoid_lower_body.xml"
+
+    return EasyDict(
+        extend_config=[],
+        base_link=base_link,
+        joint_matches=joint_matches,
+        smpl_pose_modifier=[],
+        asset_file=asset_file,
+    )
+
+
 def get_config(humanoid_type: str):
     if humanoid_type == "h1":
         return h1_mapping()
@@ -312,5 +336,7 @@ def get_config(humanoid_type: str):
         return smplx_with_limits_mapping()
     elif humanoid_type == "g1":
         return g1_mapping()
+    elif humanoid_type == "smpl_lower_body":
+        return smpl_lower_body_mapping()
     else:
         raise NotImplementedError

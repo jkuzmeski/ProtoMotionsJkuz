@@ -48,15 +48,21 @@ class NormObsBase(nn.Module):
             )
 
     def forward(self, obs, *args, **kwargs):
+        # Check for NaN values in input
         if torch.isnan(obs).any():
             raise ValueError("NaN in obs")
+            
         if self.config.normalize_obs:
             # Only update obs during training
             if self.training:
                 self.running_obs_norm.update(obs)
+                
             obs = self.running_obs_norm.normalize(obs)
+            
+        # Check for NaN values after normalization
         if torch.isnan(obs).any():
             raise ValueError("NaN in obs")
+            
         return obs
 
 

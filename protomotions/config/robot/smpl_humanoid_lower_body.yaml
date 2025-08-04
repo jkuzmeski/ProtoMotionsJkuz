@@ -1,0 +1,30 @@
+# @package _global_
+
+defaults:
+  - base
+
+robot:
+  body_names: ['Pelvis', 'L_Hip', 'L_Knee', 'L_Ankle', 'L_Toe', 'R_Hip', 'R_Knee', 'R_Ankle', 'R_Toe']
+  dof_names: ['L_Hip_x', 'L_Hip_y', 'L_Hip_z', 'L_Knee_x', 'L_Knee_y', 'L_Knee_z', 'L_Ankle_x', 'L_Ankle_y', 'L_Ankle_z', 'L_Toe_x', 'L_Toe_y', 'L_Toe_z', 'R_Hip_x', 'R_Hip_y', 'R_Hip_z', 'R_Knee_x', 'R_Knee_y', 'R_Knee_z', 'R_Ankle_x', 'R_Ankle_y', 'R_Ankle_z', 'R_Toe_x', 'R_Toe_y', 'R_Toe_z']
+  trackable_bodies_subset: ['Pelvis', 'L_Ankle', 'R_Ankle']
+
+  # Observation parameters
+  dof_obs_size: 24
+  number_of_actions: 24  # Only actuated joints (excluding root joints)
+  self_obs_max_coords_size: 133  # ${eval:1+9*(3+6+3+3)-3} - 9 bodies with position, rotation, velocity, angular velocity
+
+  # Control parameters
+  dof_body_ids: [ 1, 2, 3, 4, 5, 6, 7, 8 ]  # 8 bodies (excluding Pelvis)
+  joint_axis: ['xyz', 'xyz', 'xyz', 'xyz', 'xyz', 'xyz', 'xyz', 'xyz']  # Each joint has 3 DOFs
+
+  key_bodies: [ "R_Ankle", "L_Ankle" ]
+  non_termination_contact_bodies: [ "R_Ankle", "L_Ankle", "R_Toe", "L_Toe" ]
+  right_foot_name: "R_Ankle"
+  left_foot_name: "L_Ankle"
+  head_body_name: null
+
+  asset:
+    robot_type: smpl_humanoid_lower_body
+    asset_file_name: "mjcf/smpl_humanoid_lower_body.xml"
+    usd_asset_file_name: "usd/smpl_humanoid_lower_body.usda"
+    filter_ints: [ 0, 0, 7, 16, 12, 0, 56, 2, 33 ] 
