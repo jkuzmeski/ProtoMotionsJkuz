@@ -1,4 +1,3 @@
-
 import typer
 from dataclasses import dataclass
 from pathlib import Path
@@ -212,12 +211,12 @@ _SMPL_HUMANOID_LOWER_BODY_KEYPOINT_TO_JOINT = {
     "Pelvis": {"name": "Pelvis", "weight": 1.0},
     "L_Hip": {"name": "L_Hip", "weight": 1.5},
     "R_Hip": {"name": "R_Hip", "weight": 1.5},
-    "L_Knee": {"name": "L_Knee", "weight": 2.0},
-    "R_Knee": {"name": "R_Knee", "weight": 2.0},
-    "L_Ankle": {"name": "L_Ankle", "weight": 3.0},
-    "R_Ankle": {"name": "R_Ankle", "weight": 3.0},
-    "L_Toe": {"name": "L_Toe", "weight": 3.0},
-    "R_Toe": {"name": "R_Toe", "weight": 3.0},
+    "L_Knee": {"name": "L_Knee", "weight": 2.5},
+    "R_Knee": {"name": "R_Knee", "weight": 2.5},
+    "L_Ankle": {"name": "L_Ankle", "weight": 8.0},
+    "R_Ankle": {"name": "R_Ankle", "weight": 8.0},
+    "L_Toe": {"name": "L_Toe", "weight": 10.0},
+    "R_Toe": {"name": "R_Toe", "weight": 10.0},
 }
 _KEYPOINT_TO_JOINT_MAP = {
     "smpl_humanoid_lower_body": _SMPL_HUMANOID_LOWER_BODY_KEYPOINT_TO_JOINT,
@@ -273,6 +272,7 @@ def retarget_motion(motion, robot_type: str, robot_xml_path: str, render: bool =
     """
     Main IK solver function.
     """
+    from scipy.spatial.transform import Rotation as R
     global_translations = motion.global_translation.numpy()
     global_rotations = motion.global_rotation.numpy()
     timeseries_length = global_translations.shape[0]
@@ -296,7 +296,7 @@ def retarget_motion(motion, robot_type: str, robot_xml_path: str, render: bool =
         tasks.append(task)
     
     # Add a stronger posture task to keep the robot in a reasonable pose
-    posture_task = mink.PostureTask(model, cost=1e-2)  # Increased posture cost to prevent collapse
+    posture_task = mink.PostureTask(model, cost=1e-3)  # Reduced posture cost to allow more freedom
     tasks.append(posture_task)
     
     key_callback = KeyCallback()
@@ -306,7 +306,42 @@ def retarget_motion(motion, robot_type: str, robot_xml_path: str, render: bool =
     retargeted_trans = []
     
     solver = "quadprog"  # Use the same solver as the working mink_retarget.py
-    optimization_steps_per_frame = 2  # Reduced to prevent over-optimization
+    optimization_steps_per_frame = 12  # Increased further for better convergence
+    damping = 5e-2  # Reduced damping for better accuracy
+    # --- Detect stance phases for both feet ---
+    # Use the original motion data to determine stance for each foot
+    l_ankle_idx = mocap_joint_names.index('L_Ankle') if 'L_Ankle' in mocap_joint_names else None
+    r_ankle_idx = mocap_joint_names.index('R_Ankle') if 'R_Ankle' in mocap_joint_names else None
+    l_toe_idx = mocap_joint_names.index('L_Toe') if 'L_Toe' in mocap_joint_names else None
+    r_toe_idx = mocap_joint_names.index('R_Toe') if 'R_Toe' in mocap_joint_names else None
+    l_foot_idx = l_ankle_idx if l_ankle_idx is not None else l_toe_idx
+    r_foot_idx = r_ankle_idx if r_ankle_idx is not None else r_toe_idx
+    time_delta = 1.0 / fps
+    l_foot_pos = global_translations[:, l_foot_idx, :] if l_foot_idx is not None else None
+    r_foot_pos = global_translations[:, r_foot_idx, :] if r_foot_idx is not None else None
+    from scipy.ndimage import binary_closing, binary_opening
+
+    def safe_vel(pos):
+        if pos is None:
+            return None
+        vel = np.zeros_like(pos)
+        vel[1:] = pos[1:] - pos[:-1]
+        vel[0] = vel[1]
+        return vel / time_delta
+
+    def safe_acc(pos):
+        if pos is None:
+            return None
+        acc = np.zeros_like(pos)
+        acc[1:] = pos[1:] - pos[:-1]
+        acc[0] = acc[1]
+        return acc / time_delta
+    l_foot_vel = safe_vel(l_foot_pos)
+    r_foot_vel = safe_vel(r_foot_pos)
+    l_foot_acc = safe_acc(l_foot_pos)
+    r_foot_acc = safe_acc(r_foot_pos)
+    stance_l = detect_stance_phases(l_foot_pos, l_foot_vel, l_foot_acc) if l_foot_pos is not None else None
+    stance_r = detect_stance_phases(r_foot_pos, r_foot_vel, r_foot_acc) if r_foot_pos is not None else None
 
     if render:
         progress_bar = None
@@ -314,21 +349,36 @@ def retarget_motion(motion, robot_type: str, robot_xml_path: str, render: bool =
         progress_bar = tqdm(total=timeseries_length, desc="Retargeting")
 
     try:
-        # Initialize robot in upright position - but don't constrain it too much
+        # Initialize robot with a pose closer to the first frame targets
+        # This helps the IK solver converge faster and more accurately
         data.qpos[0:3] = global_translations[0, 0]  # Root position
         data.qpos[3:7] = [1, 0, 0, 0]  # Upright orientation (w, x, y, z)
         
-        # Set reasonable initial joint angles to prevent collapse
-        # These are approximate standing pose angles (in radians)
-        # Slightly bent knees and hips to prevent collapse
+        # Set improved initial joint angles based on target positions
+        # Analyze the first frame to estimate better starting pose
+        pelvis_pos = global_translations[0, 0, :]
+        l_ankle_pos = global_translations[0, 3, :] if len(global_translations[0]) > 3 else pelvis_pos
+        r_ankle_pos = global_translations[0, 7, :] if len(global_translations[0]) > 7 else pelvis_pos
+        
+        # Estimate knee bend based on foot-pelvis distance
+        l_leg_length = np.linalg.norm(pelvis_pos - l_ankle_pos)
+        r_leg_length = np.linalg.norm(pelvis_pos - r_ankle_pos)
+        avg_leg_length = (l_leg_length + r_leg_length) / 2
+        
+        # Calculate knee bend - more bend if legs are "compressed"
+        expected_leg_length = 0.9  # Expected straight leg length in meters
+        compression_ratio = min(avg_leg_length / expected_leg_length, 1.0)
+        knee_bend = (1.0 - compression_ratio) * 0.8  # Up to 45 degrees bend
+        
+        # Set initial joint angles with better estimates
         initial_joint_angles = np.array([
-            0.0, 0.0, 0.0,    # L_Hip - neutral
-            0.0, 0.0, 0.1,    # L_Knee - slightly bent  
-            0.0, 0.0, 0.0,    # L_Ankle - neutral
+            0.0, 0.0, 0.1,    # L_Hip - slight forward lean
+            0.0, 0.0, knee_bend,    # L_Knee - estimated bend
+            0.0, 0.0, -knee_bend * 0.5,  # L_Ankle - slight compensation
             0.0, 0.0, 0.0,    # L_Toe - neutral
-            0.0, 0.0, 0.0,    # R_Hip - neutral
-            0.0, 0.0, 0.1,    # R_Knee - slightly bent
-            0.0, 0.0, 0.0,    # R_Ankle - neutral
+            0.0, 0.0, 0.1,    # R_Hip - slight forward lean
+            0.0, 0.0, knee_bend,    # R_Knee - estimated bend
+            0.0, 0.0, -knee_bend * 0.5,  # R_Ankle - slight compensation
             0.0, 0.0, 0.0,    # R_Toe - neutral
         ])
         data.qpos[7:] = initial_joint_angles
@@ -369,47 +419,49 @@ def retarget_motion(motion, robot_type: str, robot_xml_path: str, render: bool =
             if not (viewer_context and key_callback.pause):
                 for i, (mocap_joint, _) in enumerate(keypoint_map.items()):
                     body_idx = mocap_joint_names.index(mocap_joint)
-                    target_pos = global_translations[t, body_idx, :]
+                    target_pos = global_translations[t, body_idx, :].copy()
                     
-                    # For now, let's focus only on position targets and let IK solve for orientations
-                    # This should help avoid the upside-down issue caused by dummy rotations
+                    # --- Enhanced ground constraint for stance feet ---
+                    if mocap_joint in ["L_Ankle", "L_Toe"] and stance_l is not None and stance_l[t]:
+                        # More aggressive ground constraint for stance feet
+                        target_pos[2] = max(0.0, target_pos[2] * 0.2)  # Slightly less aggressive ground constraint
+                        # Increase weight during stance for better contact
+                        tasks[i].position_cost = 12.0 * keypoint_map[mocap_joint]["weight"]
+                    elif mocap_joint in ["R_Ankle", "R_Toe"] and stance_r is not None and stance_r[t]:
+                        target_pos[2] = max(0.0, target_pos[2] * 0.2)  # Slightly less aggressive ground constraint
+                        tasks[i].position_cost = 12.0 * keypoint_map[mocap_joint]["weight"]
+                    else:
+                        # Reset to normal weight for swing phase
+                        tasks[i].position_cost = 5.0 * keypoint_map[mocap_joint]["weight"]
+                    
+                    # Apply temporal smoothing to reduce jitter
+                    if t > 0 and mocap_joint in ["L_Ankle", "R_Ankle", "L_Toe", "R_Toe"]:
+                        prev_target = retargeted_trans[-1][:3] if retargeted_trans else target_pos
+                        smoothing_factor = 0.3  # Blend current with previous
+                        target_pos = smoothing_factor * prev_target + (1 - smoothing_factor) * target_pos
+                    
                     identity_rot = mink.SO3.identity()
                     target_se3 = mink.SE3.from_rotation_and_translation(identity_rot, target_pos)
                     tasks[i].set_target(target_se3)
-                    
-                    # Debug output for first frame
                     if t == 0:
                         print(f"  Setting target for {mocap_joint}: {target_pos}")
-
                     if render:
                         mid = model.body(f"keypoint_{mocap_joint}").mocapid[0]
                         data.mocap_pos[mid] = target_pos
-                
-                # Perform multiple optimization steps per frame (like mink_retarget.py)
                 for step in range(optimization_steps_per_frame):
-                    # Add configuration limits like in mink_retarget.py
                     limits = [mink.ConfigurationLimit(model)]
+                    max_root_velocity = 3.0  # Reduced for more controlled movement
+                    max_joint_velocity = 8.0  # Reduced for smoother motion
                     
-                    # Add velocity limits to prevent unrealistic movements
-                    # Human running velocities should be reasonable (e.g., < 10 m/s for root, < 20 rad/s for joints)
-                    max_root_velocity = 5.0  # m/s - reasonable for human running
-                    max_joint_velocity = 10.0  # rad/s - reasonable for joint movements
-                    
-                    vel = mink.solve_ik(configuration, tasks, dt=1.0 / fps, solver=solver, damping=1e-1, limits=limits)
-                    
-                    # Apply velocity limits after IK solving
+                    # Use the improved damping parameter
+                    vel = mink.solve_ik(configuration, tasks, dt=1.0 / fps, solver=solver, damping=damping, limits=limits)
                     if vel.shape[0] >= 6:
-                        # Limit root velocities (first 6 DOFs: 3 pos + 3 rot)
-                        root_vel_magnitude = np.linalg.norm(vel[:3])  # Position velocity
+                        root_vel_magnitude = np.linalg.norm(vel[:3])
                         if root_vel_magnitude > max_root_velocity:
                             vel[:3] = vel[:3] * (max_root_velocity / root_vel_magnitude)
-                        
-                        # Limit root rotation velocities
-                        root_rot_vel_magnitude = np.linalg.norm(vel[3:6])  # Rotation velocity
+                        root_rot_vel_magnitude = np.linalg.norm(vel[3:6])
                         if root_rot_vel_magnitude > max_joint_velocity:
                             vel[3:6] = vel[3:6] * (max_joint_velocity / root_rot_vel_magnitude)
-                        
-                        # Limit joint velocities
                         joint_velocities = vel[6:]
                         joint_vel_magnitudes = np.linalg.norm(joint_velocities.reshape(-1, 3), axis=1)
                         for i, mag in enumerate(joint_vel_magnitudes):
@@ -417,122 +469,74 @@ def retarget_motion(motion, robot_type: str, robot_xml_path: str, render: bool =
                                 start_idx = 6 + i * 3
                                 end_idx = start_idx + 3
                                 vel[start_idx:end_idx] = vel[start_idx:end_idx] * (max_joint_velocity / mag)
-                        
-                        # Apply joint angle limits after integration
-                        # This prevents joints from going into extreme positions
-                        if step == optimization_steps_per_frame - 1:  # Only on final step
-                            # Get current joint angles
-                            current_joint_angles = data.qpos[7:]  # Skip root pos + root quat
-                            
-                            # Define more conservative joint angle limits (in radians)
-                            # These are more restrictive to prevent extreme poses
+                        if step == optimization_steps_per_frame - 1:
+                            current_joint_angles = data.qpos[7:]
                             joint_limits = {
-                                'hip': [-0.5, 0.5],      # Hip flexion/extension (more conservative)
-                                'knee': [0.0, 2.0],      # Knee flexion (0 to ~115 degrees)
-                                'ankle': [-0.5, 0.5],    # Ankle dorsiflexion/plantarflexion (more conservative)
-                                'toe': [-0.3, 0.3]       # Toe flexion/extension (more conservative)
+                                'hip': [-0.5, 0.5],
+                                'knee': [0.0, 2.0],
+                                'ankle': [-0.5, 0.5],
+                                'toe': [-0.3, 0.3]
                             }
-                            
-                            # Apply limits to joint angles
                             for i in range(0, len(current_joint_angles), 3):
                                 joint_type_idx = i // 3
                                 if joint_type_idx < len(joint_limits):
-                                    # Get the joint type (hip, knee, ankle, toe)
                                     joint_types = ['hip', 'knee', 'ankle', 'toe']
                                     joint_type = joint_types[joint_type_idx % 4]
                                     limits = joint_limits[joint_type]
-                                    
-                                    # Apply limits to each axis
                                     for axis in range(3):
                                         angle_idx = i + axis
                                         if angle_idx < len(current_joint_angles):
                                             current_joint_angles[angle_idx] = np.clip(
-                                                current_joint_angles[angle_idx], 
-                                                limits[0], 
+                                                current_joint_angles[angle_idx],
+                                                limits[0],
                                                 limits[1]
                                             )
-                            
-                            # Update the data with limited joint angles
                             data.qpos[7:] = current_joint_angles
-                    
-                    # Debug: Check the shapes to understand the DOF structure
-                    if t == 0 and step == 0:
-                        print(f"Debug: vel shape: {vel.shape}, data.qpos shape: {data.qpos.shape}")
-                        print(f"Debug: vel[:6] (root): {vel[:6]}")
-                        print(f"Debug: vel[6:] (joints): {vel[6:].shape}")
-                        print(f"Debug: data.qpos[6:] (joints): {data.qpos[6:].shape}")
-                        
-                        # Debug velocity limits
-                        root_vel_mag = np.linalg.norm(vel[:3])
-                        root_rot_vel_mag = np.linalg.norm(vel[3:6])
-                        max_joint_vel = np.max(np.linalg.norm(vel[6:].reshape(-1, 3), axis=1)) if vel.shape[0] > 6 else 0
-                        print(f"Debug: Root velocity magnitude: {root_vel_mag:.3f} m/s (limit: {max_root_velocity})")
-                        print(f"Debug: Root rotation velocity magnitude: {root_rot_vel_mag:.3f} rad/s (limit: {max_joint_velocity})")
-                        print(f"Debug: Max joint velocity magnitude: {max_joint_vel:.3f} rad/s (limit: {max_joint_velocity})")
-                    
-                    # Let the IK solver handle root movement naturally
-                    # Don't manually override the root position - let the solver work
-                    if step == 0 and t == 0:  # Only set initial position
-                        # Get the target root position from the original motion data
-                        target_root_pos = global_translations[t, 0, :]  # Pelvis is joint 0
-                        
-                        # Set initial root position but don't override it in subsequent frames
-                        data.qpos[0:3] = target_root_pos
-                        configuration.update(data.qpos)
-                    
-                    # Apply velocity integration for ALL DOFs including root
-                    # The IK solver returns 30 DOFs, but data.qpos has 31 DOFs
-                    # We need to match the shapes properly
-                    if vel.shape[0] == 30 and data.qpos.shape[0] == 31:
-                        # The IK solver returns [root_pos(3), root_rot(3), joint_angles(24)]
-                        # But data.qpos has [root_pos(3), root_quat(4), joint_angles(24)]
-                        # We need to handle the root quaternion conversion
-                        
-                        # Apply root position and rotation velocities
-                        root_pos_vel = vel[:3]  # Root position velocity
-                        root_rot_vel = vel[3:6]  # Root rotation velocity (axis-angle)
-                        joint_velocities = vel[6:]  # Joint angle velocities
-                        
-                        # Integrate root position
-                        data.qpos[:3] += root_pos_vel * (1.0 / fps)
-                        
-                        # Integrate root rotation (convert axis-angle to quaternion)
-                        # For now, use a simple approach - convert to quaternion and integrate
-                        from scipy.spatial.transform import Rotation as R
-                        current_quat = data.qpos[3:7]  # Current root quaternion
-                        rot_vel_magnitude = np.linalg.norm(root_rot_vel)
-                        if rot_vel_magnitude > 1e-6:
-                            rot_axis = root_rot_vel / rot_vel_magnitude
-                            rot_angle = rot_vel_magnitude * (1.0 / fps)
-                            delta_rot = R.from_rotvec(rot_axis * rot_angle)
-                            current_rot = R.from_quat([current_quat[1], current_quat[2], current_quat[3], current_quat[0]])  # w,x,y,z -> x,y,z,w
-                            new_rot = current_rot * delta_rot
-                            new_quat = new_rot.as_quat()  # x,y,z,w
-                            data.qpos[3:7] = [new_quat[3], new_quat[0], new_quat[1], new_quat[2]]  # w,x,y,z
-                        
-                        # Integrate joint angles
-                        joint_positions = data.qpos[7:]  # Joint positions
-                        joint_positions += joint_velocities * (1.0 / fps)
-                        data.qpos[7:] = joint_positions
-                    else:
-                        # Fallback: use the original integrate_inplace method
-                        configuration.integrate_inplace(vel, 1.0 / fps)
-                    
-                    # Update configuration with new joint positions
+                if t == 0 and step == 0:
+                    print(f"Debug: vel shape: {vel.shape}, data.qpos shape: {data.qpos.shape}")
+                    print(f"Debug: vel[:6] (root): {vel[:6]}")
+                    print(f"Debug: vel[6:] (joints): {vel[6:].shape}")
+                    print(f"Debug: data.qpos[6:] (joints): {data.qpos[6:].shape}")
+                    root_vel_mag = np.linalg.norm(vel[:3])
+                    root_rot_vel_mag = np.linalg.norm(vel[3:6])
+                    max_joint_vel = np.max(np.linalg.norm(vel[6:].reshape(-1, 3), axis=1)) if vel.shape[0] > 6 else 0
+                    print(f"Debug: Root velocity magnitude: {root_vel_mag:.3f} m/s (limit: {max_root_velocity})")
+                    print(f"Debug: Root rotation velocity magnitude: {root_rot_vel_mag:.3f} rad/s (limit: {max_joint_velocity})")
+                    print(f"Debug: Max joint velocity magnitude: {max_joint_vel:.3f} rad/s (limit: {max_joint_velocity})")
+                if step == 0 and t == 0:
+                    target_root_pos = global_translations[t, 0, :]
+                    data.qpos[0:3] = target_root_pos
                     configuration.update(data.qpos)
-                    
-                    # Debug output for first few frames
-                    if t < 5 and step == 0:
-                        print(f"  Frame {t}: Root pos: {data.qpos[:3]}, Target: {target_root_pos}")
-                        print(f"  Root movement: {np.linalg.norm(data.qpos[:3] - global_translations[0, 0, :]):.6f}m")
-                
-                retargeted_poses.append(data.qpos[6:].copy())
-                retargeted_trans.append(data.qpos[:7].copy())
-
-            if render:
-                viewer_context.sync()
-            else:
-                progress_bar.update(1)
+                if vel.shape[0] == 30 and data.qpos.shape[0] == 31:
+                    root_pos_vel = vel[:3]
+                    root_rot_vel = vel[3:6]
+                    joint_velocities = vel[6:]
+                    data.qpos[:3] += root_pos_vel * (1.0 / fps)
+                    current_quat = data.qpos[3:7]
+                    rot_vel_magnitude = np.linalg.norm(root_rot_vel)
+                    if rot_vel_magnitude > 1e-6:
+                        rot_axis = root_rot_vel / rot_vel_magnitude
+                        rot_angle = rot_vel_magnitude * (1.0 / fps)
+                        delta_rot = R.from_rotvec(rot_axis * rot_angle)
+                        current_rot = R.from_quat([current_quat[1], current_quat[2], current_quat[3], current_quat[0]])
+                        new_rot = current_rot * delta_rot
+                        new_quat = new_rot.as_quat()
+                        data.qpos[3:7] = [new_quat[3], new_quat[0], new_quat[1], new_quat[2]]
+                    joint_positions = data.qpos[7:]
+                    joint_positions += joint_velocities * (1.0 / fps)
+                    data.qpos[7:] = joint_positions
+                else:
+                    configuration.integrate_inplace(vel, 1.0 / fps)
+                configuration.update(data.qpos)
+                if t < 5 and step == 0:
+                    print(f"  Frame {t}: Root pos: {data.qpos[:3]}, Target: {target_root_pos}")
+                    print(f"  Root movement: {np.linalg.norm(data.qpos[:3] - global_translations[0, 0, :]):.6f}m")
+            retargeted_poses.append(data.qpos[6:].copy())
+            retargeted_trans.append(data.qpos[:7].copy())
+        if render:
+            viewer_context.sync()
+        else:
+            progress_bar.update(1)
     finally:
         if progress_bar:
             progress_bar.close()
