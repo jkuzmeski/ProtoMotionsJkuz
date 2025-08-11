@@ -4,6 +4,7 @@ Test script to verify motion file compatibility between convert_to_isaac.py and 
 """
 
 import torch
+import numpy as np
 from pathlib import Path
 from poselib.skeleton.skeleton3d import SkeletonMotion
 
@@ -65,8 +66,28 @@ def test_motion_lib_compatibility(motion_file_path: str):
                 self.num_dof = 24  # Total DOFs
                 self.joint_axis = ["x", "y", "z"] * 8  # Joint axes
         
+        # First, let's inspect the motion to find foot body IDs
+        from poselib.skeleton.skeleton3d import SkeletonMotion
+        motion = SkeletonMotion.from_file(motion_file_path)
+        
+        # Find bodies with lowest Z coordinates (likely feet)
+        first_frame_z = motion.global_translation[0, :, 2]  # Z coordinates of all bodies
+        sorted_indices = np.argsort(first_frame_z)
+        
+        print("🦶 Body Z-coordinates analysis (first frame):")
+        print("Lowest 8 bodies (potential feet/ankles):")
+        for i, idx in enumerate(sorted_indices[:8]):
+            name = motion.skeleton_tree.node_names[idx] if hasattr(motion.skeleton_tree, 'node_names') else f"body_{idx}"
+            z = first_frame_z[idx]
+            print(f"  {i+1}. Body {idx:2d}: {name:15s} -> Z={z:.4f}")
+        
+        # Use the two lowest bodies as feet (assuming they're left and right feet)
+        foot_body_ids = sorted_indices[:2]
+        key_body_ids = torch.tensor(foot_body_ids, dtype=torch.long)
+        print(f"\n✅ Using body IDs {foot_body_ids.tolist()} as feet")
+        
         robot_config = MockRobotConfig()
-        key_body_ids = torch.tensor([0, 1], dtype=torch.long)  # Pelvis and first joint
+        print(f"Key body IDs for feet: {key_body_ids.tolist()}")
         
         # Try to create MotionLib instance
         motion_lib = MotionLib(
@@ -90,7 +111,25 @@ def test_motion_lib_compatibility(motion_file_path: str):
         print(f"  - Root position shape: {motion_state.root_pos.shape}")
         print(f"  - DOF position shape: {motion_state.dof_pos.shape}")
         
+        # Check foot positions
+        print(f"\n🦶 Foot analysis:")
+        print(f"key_body_pos shape: {motion_state.key_body_pos.shape}")
+        print(f"key_body_pos values: {motion_state.key_body_pos}")
+        
+        foot_z_coords = motion_state.key_body_pos[0, :, 2]  # Z coordinates of feet
+        print(f"Foot Z coordinates: {foot_z_coords}")
+        if torch.all(foot_z_coords < 0.1):
+            print("✅ Feet are on or near the ground!")
+        else:
+            print("⚠️  Feet are still floating - check body IDs!")
+        
         return True
+        
+    except Exception as e:
+        print(f"❌ Error during motion processing: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
         
     except Exception as e:
         print(f"❌ Failed to use with motion_lib.py: {e}")

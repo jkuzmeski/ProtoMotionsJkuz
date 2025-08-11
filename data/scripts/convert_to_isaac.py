@@ -1,7 +1,7 @@
 import typer
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Sequence, Dict, Any, List
+from typing import Sequence, Optional
 import torch
 import numpy as np
 from dm_control import mjcf
@@ -10,200 +10,15 @@ from collections import OrderedDict
 
 import mujoco
 import mujoco.viewer
-import mink
-from poselib.skeleton.skeleton3d import SkeletonTree, SkeletonState
-from tqdm import tqdm
+
+from poselib.skeleton.skeleton3d import SkeletonTree, SkeletonMotion, SkeletonState
+
 import pandas as pd
 import poselib.core.rotation3d as pRot
-from poselib.core.tensor_utils import tensor_to_dict
+# tensor_to_dict not needed since we use numpy arrays directly
 import matplotlib.pyplot as plt
-
-
-def _get_tpose_global_positions(skeleton_tree: SkeletonTree) -> np.ndarray:
-    """Computes the global positions of joints in the T-pose from the skeleton tree."""
-    parents = skeleton_tree.parent_indices.numpy()
-    local_translations = skeleton_tree.local_translation.numpy()
-    num_joints = len(parents)
-    tpose_global_pos = np.zeros((num_joints, 3), dtype=np.float32)
-    for i in range(num_joints):
-        if parents[i] == -1:
-            tpose_global_pos[i] = local_translations[i]
-        else:
-            tpose_global_pos[i] = tpose_global_pos[parents[i]] + local_translations[i]
-    return tpose_global_pos
-
-
-def debug_visualize_computed_positions(
-    skeleton_tree: SkeletonTree,
-    original_global_translations: np.ndarray,
-    local_rotations_xyzw: np.ndarray,
-    title: str = "Debug: Original vs. Reconstructed Positions"
-):
-    """
-    Visualizes the difference between original and rotation-reconstructed joint positions.
-    Red spheres = original data. Blue spheres = reconstructed from computed rotations.
-    If blue and red match, rotation computation is likely correct.
-    """
-    print(f"\n--- Running Debug Analysis: {title} ---")
-    
-    # Print some debug info about the input data
-    print(f"Original positions shape: {original_global_translations.shape}")
-    print(f"Original first frame positions:")
-    for i, name in enumerate(skeleton_tree.node_names):
-        print(f"  {name}: {original_global_translations[0, i, :]}")
-    
-    # Reconstruct global positions from the computed local rotations
-    num_frames = original_global_translations.shape[0]
-    # poselib uses w,x,y,z quaternions. Our computed are x,y,z,w, so we convert.
-    local_rotations_wxyz = local_rotations_xyzw[..., [3, 0, 1, 2]]
-    
-    print(f"Local rotations shape: {local_rotations_wxyz.shape}")
-    print(f"First frame local rotations:")
-    for i, name in enumerate(skeleton_tree.node_names):
-        print(f"  {name}: {local_rotations_wxyz[0, i, :]}")
-    
-    try:
-        sk_state = SkeletonState.from_rotation_and_root_translation(
-            skeleton_tree,
-            torch.from_numpy(local_rotations_wxyz).float(),
-            torch.from_numpy(original_global_translations[:, 0, :]).float(),  # Use original root translation
-            is_local=True
-        )
-        reconstructed_global_translations = sk_state.global_translation.numpy()
-        
-        print(f"Reconstructed positions shape: {reconstructed_global_translations.shape}")
-        print(f"Reconstructed first frame positions:")
-        for i, name in enumerate(skeleton_tree.node_names):
-            print(f"  {name}: {reconstructed_global_translations[0, i, :]}")
-            
-        # Check if reconstruction worked
-        diff = np.abs(original_global_translations[0] - reconstructed_global_translations[0])
-        print(f"\nPosition differences (first frame):")
-        for i, name in enumerate(skeleton_tree.node_names):
-            print(f"  {name}: {diff[i, :]} (max: {np.max(diff[i, :]):.6f})")
-        print(f"Overall max difference: {np.max(diff):.6f}")
-        
-        if np.max(diff) < 0.01:
-            print("✅ Rotation computation appears to be working correctly!")
-        else:
-            print("❌ Large differences detected - rotation computation has issues")
-            
-    except Exception as e:
-        print(f"❌ Error in reconstruction: {e}")
-        import traceback
-        traceback.print_exc()
-        
-    print("--- Debug Analysis Finished ---")
-
-
-def compute_rotations_from_motion(
-    global_translations: np.ndarray,
-    skeleton_tree: SkeletonTree
-) -> np.ndarray:
-    """
-    Computes local joint rotations from global joint positions using a simple bone alignment method.
-    
-    This simplified approach focuses on aligning each bone with its reference direction in the T-pose,
-    which should be sufficient for the IK solver to work with.
-
-    Args:
-        global_translations (np.ndarray): A numpy array of shape (num_frames, num_joints, 3)
-                                          containing the global position of each joint for each frame.
-        skeleton_tree (SkeletonTree): A poselib SkeletonTree object describing the robot's hierarchy.
-
-    Returns:
-        np.ndarray: A numpy array of shape (num_frames, num_joints, 4) containing the computed
-                    local rotation for each joint as a quaternion (x, y, z, w).
-    """
-    print("Using simplified rotation computation approach...")
-    
-    num_frames = global_translations.shape[0]
-    parents = skeleton_tree.parent_indices.numpy()
-    joint_names = skeleton_tree.node_names
-    num_joints = len(joint_names)
-
-    # Get T-pose reference positions
-    tpose_global_pos = _get_tpose_global_positions(skeleton_tree)   
-    from scipy.spatial.transform import Rotation as R
-    
-    # Initialize with identity rotations
-    local_rotations_quat = np.zeros((num_frames, num_joints, 4))
-    local_rotations_quat[..., 3] = 1.0  # w component = 1 for identity
-
-    print(f"Processing {num_frames} frames for {num_joints} joints...")
-    print(f"Joint names: {joint_names}")
-    print(f"T-pose positions shape: {tpose_global_pos.shape}")
-    print(f"Current positions shape: {global_translations.shape}")
-    
-    # Debug: Print T-pose positions
-    print("\n=== T-POSE POSITIONS ===")
-    for j, name in enumerate(joint_names):
-        print(f"{j}: {name} -> {tpose_global_pos[j]}")
-    
-    # Debug: Print first frame positions
-    print("\n=== FIRST FRAME POSITIONS ===")
-    for j, name in enumerate(joint_names):
-        print(f"{j}: {name} -> {global_translations[0, j]}")
-    
-    # Debug: Print parent relationships
-    print(f"\n=== PARENT RELATIONSHIPS ===")
-    for j, name in enumerate(joint_names):
-        parent_idx = parents[j]
-        parent_name = joint_names[parent_idx] if parent_idx != -1 else "ROOT"
-        print(f"{j}: {name} -> parent: {parent_idx} ({parent_name})")
-
-    for i in tqdm(range(num_frames), desc="Computing Simple Rotations"):
-        current_global_pos = global_translations[i]
-        
-        for j in range(num_joints):
-            parent_idx = parents[j]
-            
-            if parent_idx == -1:
-                # Root joint - keep identity rotation for now
-                # The IK solver will handle the root orientation
-                local_rotations_quat[i, j] = [0, 0, 0, 1]  # identity
-            else:
-                # For child joints, compute rotation to align bone direction
-                try:
-                    # Reference bone direction in T-pose
-                    bone_ref = tpose_global_pos[j] - tpose_global_pos[parent_idx]
-                    bone_ref_norm = np.linalg.norm(bone_ref)
-                    
-                    # Current bone direction
-                    bone_cur = current_global_pos[j] - current_global_pos[parent_idx]
-                    bone_cur_norm = np.linalg.norm(bone_cur)
-                    
-                    if bone_ref_norm > 1e-6 and bone_cur_norm > 1e-6:
-                        # Normalize vectors
-                        bone_ref_unit = bone_ref / bone_ref_norm
-                        bone_cur_unit = bone_cur / bone_cur_norm
-                        
-                        # Debug output for first frame
-                        if i == 0:
-                            print(f"  Joint {j} ({joint_names[j]}):")
-                            print(f"    T-pose bone: {bone_ref} (norm: {bone_ref_norm:.4f})")
-                            print(f"    Current bone: {bone_cur} (norm: {bone_cur_norm:.4f})")
-                            print(f"    T-pose unit: {bone_ref_unit}")
-                            print(f"    Current unit: {bone_cur_unit}")
-                        
-                        # Compute rotation to align reference to current
-                        rot, _ = R.align_vectors([bone_cur_unit], [bone_ref_unit])
-                        local_rotations_quat[i, j] = rot.as_quat()
-                        
-                        if i == 0:
-                            print(f"    Computed rotation: {rot.as_quat()}")
-                    else:
-                        # Degenerate case - use identity
-                        local_rotations_quat[i, j] = [0, 0, 0, 1]
-                        if i == 0:
-                            print(f"  Joint {j} ({joint_names[j]}): DEGENERATE CASE (bone lengths: ref={bone_ref_norm:.6f}, cur={bone_cur_norm:.6f})")
-                        
-                except Exception as e:
-                    print(f"Warning: Failed to compute rotation for joint {j} ({joint_names[j]}) at frame {i}: {e}")
-                    local_rotations_quat[i, j] = [0, 0, 0, 1]
-
-    print("Rotation computation completed.")
-    return local_rotations_quat
+from scipy.spatial.transform import Rotation as R
+from .treadmill2overground import transform_treadmill_to_overground
 
 
 # --- Configuration for Your Lower Body Robot ---
@@ -212,11 +27,11 @@ _SMPL_HUMANOID_LOWER_BODY_KEYPOINT_TO_JOINT = {
     "L_Hip": {"name": "L_Hip", "weight": 1.5},
     "R_Hip": {"name": "R_Hip", "weight": 1.5},
     "L_Knee": {"name": "L_Knee", "weight": 2.5},
-    "R_Knee": {"name": "R_Knee", "weight": 2.5},
+    "R_Knee": {"name": "R_Knee", "weight": 2.0},  # Reduced weight for right knee
     "L_Ankle": {"name": "L_Ankle", "weight": 8.0},
-    "R_Ankle": {"name": "R_Ankle", "weight": 8.0},
+    "R_Ankle": {"name": "R_Ankle", "weight": 5.0},  # Reduced weight for right ankle
     "L_Toe": {"name": "L_Toe", "weight": 10.0},
-    "R_Toe": {"name": "R_Toe", "weight": 10.0},
+    "R_Toe": {"name": "R_Toe", "weight": 7.0},     # Reduced weight for right toe
 }
 _KEYPOINT_TO_JOINT_MAP = {
     "smpl_humanoid_lower_body": _SMPL_HUMANOID_LOWER_BODY_KEYPOINT_TO_JOINT,
@@ -235,10 +50,11 @@ class KeyCallback:
 
 @dataclass
 class SimpleMotion:
-    """A simple container to hold motion data."""
-    global_translation: torch.Tensor
-    global_rotation: torch.Tensor  # Added this field
-    skeleton_tree: SkeletonTree
+    """A simple container to hold motion data for all joints."""
+    global_translation: torch.Tensor  # All joint positions (including pelvis)
+    global_rotation: torch.Tensor     # All joint rotations (local format)
+    local_rotation: torch.Tensor      # All joint rotations (local format)
+    skeleton_tree: SkeletonTree       # Complete skeleton tree
     fps: int
 
 
@@ -256,7 +72,7 @@ def construct_model(robot_xml_path: str, keypoint_names: Sequence[str]):
         body = robot_mjcf.worldbody.add('body', name=f"keypoint_{name}", mocap=True)
         rgb = np.random.rand(3)
         body.add('site', name=f"site_{name}", type='sphere', size=[0.02],
-                   rgba=f"{rgb[0]} {rgb[1]} {rgb[2]} 1")
+                 rgba=f"{rgb[0]} {rgb[1]} {rgb[2]} 1")
     
     # Add a camera for viewing
     robot_mjcf.worldbody.add(
@@ -267,646 +83,117 @@ def construct_model(robot_xml_path: str, keypoint_names: Sequence[str]):
     # Compile the final model from the XML string
     return mujoco.MjModel.from_xml_string(robot_mjcf.to_xml_string())
 
-
-def retarget_motion(motion, robot_type: str, robot_xml_path: str, render: bool = False):
-    """
-    Main IK solver function.
-    """
-    from scipy.spatial.transform import Rotation as R
-    global_translations = motion.global_translation.numpy()
-    global_rotations = motion.global_rotation.numpy()
-    timeseries_length = global_translations.shape[0]
-    fps = motion.fps
-    
-    mocap_joint_names = motion.skeleton_tree.node_names
-
-    model = construct_model(robot_xml_path, mocap_joint_names)
-    data = mujoco.MjData(model)
-    configuration = mink.Configuration(model)
-
-    tasks = []
-    keypoint_map = _KEYPOINT_TO_JOINT_MAP[robot_type]
-    for mocap_joint, retarget_info in keypoint_map.items():
-        task = mink.FrameTask(
-            frame_name=retarget_info["name"],
-            frame_type="body",
-            position_cost=5.0 * retarget_info["weight"],  # Reduced to prevent over-reaching
-            orientation_cost=0.1 * retarget_info["weight"],  # Increased to maintain orientation
-        )
-        tasks.append(task)
-    
-    # Add a stronger posture task to keep the robot in a reasonable pose
-    posture_task = mink.PostureTask(model, cost=1e-3)  # Reduced posture cost to allow more freedom
-    tasks.append(posture_task)
-    
-    key_callback = KeyCallback()
-    viewer_context = mujoco.viewer.launch_passive(model, data, key_callback=key_callback) if render else None
-
-    retargeted_poses = []
-    retargeted_trans = []
-    
-    solver = "quadprog"  # Use the same solver as the working mink_retarget.py
-    optimization_steps_per_frame = 12  # Increased further for better convergence
-    damping = 5e-2  # Reduced damping for better accuracy
-    # --- Detect stance phases for both feet ---
-    # Use the original motion data to determine stance for each foot
-    l_ankle_idx = mocap_joint_names.index('L_Ankle') if 'L_Ankle' in mocap_joint_names else None
-    r_ankle_idx = mocap_joint_names.index('R_Ankle') if 'R_Ankle' in mocap_joint_names else None
-    l_toe_idx = mocap_joint_names.index('L_Toe') if 'L_Toe' in mocap_joint_names else None
-    r_toe_idx = mocap_joint_names.index('R_Toe') if 'R_Toe' in mocap_joint_names else None
-    l_foot_idx = l_ankle_idx if l_ankle_idx is not None else l_toe_idx
-    r_foot_idx = r_ankle_idx if r_ankle_idx is not None else r_toe_idx
-    time_delta = 1.0 / fps
-    l_foot_pos = global_translations[:, l_foot_idx, :] if l_foot_idx is not None else None
-    r_foot_pos = global_translations[:, r_foot_idx, :] if r_foot_idx is not None else None
-    from scipy.ndimage import binary_closing, binary_opening
-
-    def safe_vel(pos):
-        if pos is None:
-            return None
-        vel = np.zeros_like(pos)
-        vel[1:] = pos[1:] - pos[:-1]
-        vel[0] = vel[1]
-        return vel / time_delta
-
-    def safe_acc(pos):
-        if pos is None:
-            return None
-        acc = np.zeros_like(pos)
-        acc[1:] = pos[1:] - pos[:-1]
-        acc[0] = acc[1]
-        return acc / time_delta
-    l_foot_vel = safe_vel(l_foot_pos)
-    r_foot_vel = safe_vel(r_foot_pos)
-    l_foot_acc = safe_acc(l_foot_pos)
-    r_foot_acc = safe_acc(r_foot_pos)
-    stance_l = detect_stance_phases(l_foot_pos, l_foot_vel, l_foot_acc) if l_foot_pos is not None else None
-    stance_r = detect_stance_phases(r_foot_pos, r_foot_vel, r_foot_acc) if r_foot_pos is not None else None
-
-    if render:
-        progress_bar = None
-    else:
-        progress_bar = tqdm(total=timeseries_length, desc="Retargeting")
-
-    try:
-        # Initialize robot with a pose closer to the first frame targets
-        # This helps the IK solver converge faster and more accurately
-        data.qpos[0:3] = global_translations[0, 0]  # Root position
-        data.qpos[3:7] = [1, 0, 0, 0]  # Upright orientation (w, x, y, z)
-        
-        # Set improved initial joint angles based on target positions
-        # Analyze the first frame to estimate better starting pose
-        pelvis_pos = global_translations[0, 0, :]
-        l_ankle_pos = global_translations[0, 3, :] if len(global_translations[0]) > 3 else pelvis_pos
-        r_ankle_pos = global_translations[0, 7, :] if len(global_translations[0]) > 7 else pelvis_pos
-        
-        # Estimate knee bend based on foot-pelvis distance
-        l_leg_length = np.linalg.norm(pelvis_pos - l_ankle_pos)
-        r_leg_length = np.linalg.norm(pelvis_pos - r_ankle_pos)
-        avg_leg_length = (l_leg_length + r_leg_length) / 2
-        
-        # Calculate knee bend - more bend if legs are "compressed"
-        expected_leg_length = 0.9  # Expected straight leg length in meters
-        compression_ratio = min(avg_leg_length / expected_leg_length, 1.0)
-        knee_bend = (1.0 - compression_ratio) * 0.8  # Up to 45 degrees bend
-        
-        # Set initial joint angles with better estimates
-        initial_joint_angles = np.array([
-            0.0, 0.0, 0.1,    # L_Hip - slight forward lean
-            0.0, 0.0, knee_bend,    # L_Knee - estimated bend
-            0.0, 0.0, -knee_bend * 0.5,  # L_Ankle - slight compensation
-            0.0, 0.0, 0.0,    # L_Toe - neutral
-            0.0, 0.0, 0.1,    # R_Hip - slight forward lean
-            0.0, 0.0, knee_bend,    # R_Knee - estimated bend
-            0.0, 0.0, -knee_bend * 0.5,  # R_Ankle - slight compensation
-            0.0, 0.0, 0.0,    # R_Toe - neutral
-        ])
-        data.qpos[7:] = initial_joint_angles
-        
-        print(f"Debug: Initial root position: {data.qpos[0:3]}")
-        print(f"Debug: Initial root orientation: {data.qpos[3:7]}")
-        print(f"Debug: Initial joint angles: {data.qpos[7:]}")
-        print(f"Debug: First frame target positions:")
-        for i, name in enumerate(mocap_joint_names):
-            print(f"  {name}: {global_translations[0, i, :]}")
-        
-        # Check if target positions are reasonable
-        print(f"Debug: Target position analysis:")
-        pelvis_pos = global_translations[0, 0, :]  # Pelvis
-        left_foot_pos = global_translations[0, 4, :]  # L_Toe
-        right_foot_pos = global_translations[0, 8, :]  # R_Toe
-        
-        print(f"  Pelvis height: {pelvis_pos[2]:.3f}m")
-        print(f"  Left foot height: {left_foot_pos[2]:.3f}m")
-        print(f"  Right foot height: {right_foot_pos[2]:.3f}m")
-        print(f"  Pelvis to left foot distance: {np.linalg.norm(pelvis_pos - left_foot_pos):.3f}m")
-        print(f"  Pelvis to right foot distance: {np.linalg.norm(pelvis_pos - right_foot_pos):.3f}m")
-        
-        # Check if feet are above pelvis (which would cause collapse)
-        if left_foot_pos[2] > pelvis_pos[2] or right_foot_pos[2] > pelvis_pos[2]:
-            print(f"  ⚠️  WARNING: Feet are above pelvis! This will cause collapse.")
-            print(f"  Left foot is {left_foot_pos[2] - pelvis_pos[2]:.3f}m above pelvis")
-            print(f"  Right foot is {right_foot_pos[2] - pelvis_pos[2]:.3f}m above pelvis")
-        else:
-            print(f"  ✅ Feet are below pelvis - positions look reasonable")
-        
-        mujoco.mj_forward(model, data)
-        
-        # Set a much weaker posture task to allow more movement
-        posture_task.set_target_from_configuration(configuration)
-
-        for t in range(timeseries_length):
-            if not (viewer_context and key_callback.pause):
-                for i, (mocap_joint, _) in enumerate(keypoint_map.items()):
-                    body_idx = mocap_joint_names.index(mocap_joint)
-                    target_pos = global_translations[t, body_idx, :].copy()
-                    
-                    # --- Enhanced ground constraint for stance feet ---
-                    if mocap_joint in ["L_Ankle", "L_Toe"] and stance_l is not None and stance_l[t]:
-                        # More aggressive ground constraint for stance feet
-                        target_pos[2] = max(0.0, target_pos[2] * 0.2)  # Slightly less aggressive ground constraint
-                        # Increase weight during stance for better contact
-                        tasks[i].position_cost = 12.0 * keypoint_map[mocap_joint]["weight"]
-                    elif mocap_joint in ["R_Ankle", "R_Toe"] and stance_r is not None and stance_r[t]:
-                        target_pos[2] = max(0.0, target_pos[2] * 0.2)  # Slightly less aggressive ground constraint
-                        tasks[i].position_cost = 12.0 * keypoint_map[mocap_joint]["weight"]
-                    else:
-                        # Reset to normal weight for swing phase
-                        tasks[i].position_cost = 5.0 * keypoint_map[mocap_joint]["weight"]
-                    
-                    # Apply temporal smoothing to reduce jitter
-                    if t > 0 and mocap_joint in ["L_Ankle", "R_Ankle", "L_Toe", "R_Toe"]:
-                        prev_target = retargeted_trans[-1][:3] if retargeted_trans else target_pos
-                        smoothing_factor = 0.3  # Blend current with previous
-                        target_pos = smoothing_factor * prev_target + (1 - smoothing_factor) * target_pos
-                    
-                    identity_rot = mink.SO3.identity()
-                    target_se3 = mink.SE3.from_rotation_and_translation(identity_rot, target_pos)
-                    tasks[i].set_target(target_se3)
-                    if t == 0:
-                        print(f"  Setting target for {mocap_joint}: {target_pos}")
-                    if render:
-                        mid = model.body(f"keypoint_{mocap_joint}").mocapid[0]
-                        data.mocap_pos[mid] = target_pos
-                for step in range(optimization_steps_per_frame):
-                    limits = [mink.ConfigurationLimit(model)]
-                    max_root_velocity = 3.0  # Reduced for more controlled movement
-                    max_joint_velocity = 8.0  # Reduced for smoother motion
-                    
-                    # Use the improved damping parameter
-                    vel = mink.solve_ik(configuration, tasks, dt=1.0 / fps, solver=solver, damping=damping, limits=limits)
-                    if vel.shape[0] >= 6:
-                        root_vel_magnitude = np.linalg.norm(vel[:3])
-                        if root_vel_magnitude > max_root_velocity:
-                            vel[:3] = vel[:3] * (max_root_velocity / root_vel_magnitude)
-                        root_rot_vel_magnitude = np.linalg.norm(vel[3:6])
-                        if root_rot_vel_magnitude > max_joint_velocity:
-                            vel[3:6] = vel[3:6] * (max_joint_velocity / root_rot_vel_magnitude)
-                        joint_velocities = vel[6:]
-                        joint_vel_magnitudes = np.linalg.norm(joint_velocities.reshape(-1, 3), axis=1)
-                        for i, mag in enumerate(joint_vel_magnitudes):
-                            if mag > max_joint_velocity:
-                                start_idx = 6 + i * 3
-                                end_idx = start_idx + 3
-                                vel[start_idx:end_idx] = vel[start_idx:end_idx] * (max_joint_velocity / mag)
-                        if step == optimization_steps_per_frame - 1:
-                            current_joint_angles = data.qpos[7:]
-                            joint_limits = {
-                                'hip': [-0.5, 0.5],
-                                'knee': [0.0, 2.0],
-                                'ankle': [-0.5, 0.5],
-                                'toe': [-0.3, 0.3]
-                            }
-                            for i in range(0, len(current_joint_angles), 3):
-                                joint_type_idx = i // 3
-                                if joint_type_idx < len(joint_limits):
-                                    joint_types = ['hip', 'knee', 'ankle', 'toe']
-                                    joint_type = joint_types[joint_type_idx % 4]
-                                    limits = joint_limits[joint_type]
-                                    for axis in range(3):
-                                        angle_idx = i + axis
-                                        if angle_idx < len(current_joint_angles):
-                                            current_joint_angles[angle_idx] = np.clip(
-                                                current_joint_angles[angle_idx],
-                                                limits[0],
-                                                limits[1]
-                                            )
-                            data.qpos[7:] = current_joint_angles
-                if t == 0 and step == 0:
-                    print(f"Debug: vel shape: {vel.shape}, data.qpos shape: {data.qpos.shape}")
-                    print(f"Debug: vel[:6] (root): {vel[:6]}")
-                    print(f"Debug: vel[6:] (joints): {vel[6:].shape}")
-                    print(f"Debug: data.qpos[6:] (joints): {data.qpos[6:].shape}")
-                    root_vel_mag = np.linalg.norm(vel[:3])
-                    root_rot_vel_mag = np.linalg.norm(vel[3:6])
-                    max_joint_vel = np.max(np.linalg.norm(vel[6:].reshape(-1, 3), axis=1)) if vel.shape[0] > 6 else 0
-                    print(f"Debug: Root velocity magnitude: {root_vel_mag:.3f} m/s (limit: {max_root_velocity})")
-                    print(f"Debug: Root rotation velocity magnitude: {root_rot_vel_mag:.3f} rad/s (limit: {max_joint_velocity})")
-                    print(f"Debug: Max joint velocity magnitude: {max_joint_vel:.3f} rad/s (limit: {max_joint_velocity})")
-                if step == 0 and t == 0:
-                    target_root_pos = global_translations[t, 0, :]
-                    data.qpos[0:3] = target_root_pos
-                    configuration.update(data.qpos)
-                if vel.shape[0] == 30 and data.qpos.shape[0] == 31:
-                    root_pos_vel = vel[:3]
-                    root_rot_vel = vel[3:6]
-                    joint_velocities = vel[6:]
-                    data.qpos[:3] += root_pos_vel * (1.0 / fps)
-                    current_quat = data.qpos[3:7]
-                    rot_vel_magnitude = np.linalg.norm(root_rot_vel)
-                    if rot_vel_magnitude > 1e-6:
-                        rot_axis = root_rot_vel / rot_vel_magnitude
-                        rot_angle = rot_vel_magnitude * (1.0 / fps)
-                        delta_rot = R.from_rotvec(rot_axis * rot_angle)
-                        current_rot = R.from_quat([current_quat[1], current_quat[2], current_quat[3], current_quat[0]])
-                        new_rot = current_rot * delta_rot
-                        new_quat = new_rot.as_quat()
-                        data.qpos[3:7] = [new_quat[3], new_quat[0], new_quat[1], new_quat[2]]
-                    joint_positions = data.qpos[7:]
-                    joint_positions += joint_velocities * (1.0 / fps)
-                    data.qpos[7:] = joint_positions
-                else:
-                    configuration.integrate_inplace(vel, 1.0 / fps)
-                configuration.update(data.qpos)
-                if t < 5 and step == 0:
-                    print(f"  Frame {t}: Root pos: {data.qpos[:3]}, Target: {target_root_pos}")
-                    print(f"  Root movement: {np.linalg.norm(data.qpos[:3] - global_translations[0, 0, :]):.6f}m")
-            retargeted_poses.append(data.qpos[6:].copy())
-            retargeted_trans.append(data.qpos[:7].copy())
-        if render:
-            viewer_context.sync()
-        else:
-            progress_bar.update(1)
-    finally:
-        if progress_bar:
-            progress_bar.close()
-
-    return np.stack(retargeted_poses), np.stack(retargeted_trans)
-
-
-def detect_stance_phases(
-    foot_positions,
-    foot_velocities,
-    foot_accelerations,
-    height_threshold=0.05,
-    vertical_velocity_threshold=0.1,
-    horizontal_acceleration_threshold=0.5,
-):
-    """
-    Detects stance phases based on robust biomechanical criteria suitable for treadmill running.
-
-    A foot is considered in a stance phase if it meets three conditions:
-    1. It is close to the ground (low height).
-    2. It has minimal vertical movement (low vertical velocity).
-    3. It is moving at a constant horizontal velocity (low horizontal acceleration),
-       which corresponds to the treadmill belt speed.
-
-    Args:
-        foot_positions (np.ndarray): (n_frames, 3) array of foot positions.
-        foot_velocities (np.ndarray): (n_frames, 3) array of foot velocities.
-        foot_accelerations (np.ndarray): (n_frames, 3) array of foot accelerations.
-        height_threshold (float): The maximum height (in meters) for a foot to be
-                                  considered near the ground.
-        vertical_velocity_threshold (float): The maximum vertical velocity (m/s)
-                                             to be considered stationary.
-        horizontal_acceleration_threshold (float): The maximum horizontal acceleration (m/s^2)
-                                                   for the foot to be considered moving at a
-                                                   constant velocity.
-
-    Returns:
-        np.ndarray: A boolean array where True indicates a stance phase.
-    """
-    # 1. Foot is close to the ground.
-    height_condition = foot_positions[:, 2] < height_threshold
-
-    # 2. Foot has minimal vertical velocity.
-    vertical_velocity_condition = np.abs(foot_velocities[:, 2]) < vertical_velocity_threshold
-
-    # 3. Foot has minimal horizontal acceleration (moving at constant velocity with the belt).
-    horizontal_acceleration = np.linalg.norm(foot_accelerations[:, :2], axis=1)
-    horizontal_acceleration_condition = horizontal_acceleration < horizontal_acceleration_threshold
-
-    # Combine all conditions. A foot is in stance if all are true.
-    stance_mask = height_condition & vertical_velocity_condition & horizontal_acceleration_condition
-
-    # Clean up isolated stance/swing detections with morphological operations
-    # to remove noise and create more contiguous stance phases.
-    from scipy.ndimage import binary_closing, binary_opening
-    stance_mask = binary_closing(stance_mask, structure=np.ones(5))
-    stance_mask = binary_opening(stance_mask, structure=np.ones(3))
-
-    return stance_mask
-
-
-def transform_treadmill_to_overground(joint_centers, joint_names, fps, treadmill_speed):
-    """
-    Transform treadmill motion to overground motion by stabilizing stance feet.
-
-    This function remaps motion captured on a treadmill to appear as if it were
-    performed overground. It works by calculating an offset at each frame to
-    ensure the foot (or feet) currently in a stance phase remains stationary
-    in the world coordinate system. This offset is then applied to all joints.
-
-    The transformation is derived directly from the motion data, making it
-    robust to variations in treadmill speed and actor performance.
-
-    In treadmill motion:
-    - Pelvis stays relatively stationary in the world frame.
-    - Feet move backward during stance.
-
-    In the transformed overground motion:
-    - Stance foot remains stationary.
-    - Pelvis moves forward over the stance foot.
-
-    Args:
-        joint_centers (np.ndarray): (n_frames, n_joints, 3) array of joint positions.
-        joint_names (list): List of joint names.
-        fps (int): Frames per second of the motion capture data.
-
-    Returns:
-        np.ndarray: (n_frames, n_joints, 3) array of transformed joint positions.
-    """
-    print("Applying data-driven treadmill-to-overground transformation...")
-    
-    # Find joint indices
-    l_ankle_idx = joint_names.index('L_Ankle') if 'L_Ankle' in joint_names else None
-    r_ankle_idx = joint_names.index('R_Ankle') if 'R_Ankle' in joint_names else None
-    l_toe_idx = joint_names.index('L_Toe') if 'L_Toe' in joint_names else None
-    r_toe_idx = joint_names.index('R_Toe') if 'R_Toe' in joint_names else None
-    
-    # Use ankle if available, otherwise toe
-    l_foot_idx = l_ankle_idx if l_ankle_idx is not None else l_toe_idx
-    r_foot_idx = r_ankle_idx if r_ankle_idx is not None else r_toe_idx
-    
-    if l_foot_idx is None or r_foot_idx is None:
-        print("Warning: Could not find foot joints, skipping transformation.")
-        return joint_centers.copy()
-    
-    n_frames, n_joints, _ = joint_centers.shape
-    time_delta = 1.0 / fps
-    
-    # Calculate foot velocities for stance detection
-    l_foot_pos = joint_centers[:, l_foot_idx, :]
-    r_foot_pos = joint_centers[:, r_foot_idx, :]
-    
-    # Use improved velocity calculation for better boundary handling
-    l_foot_vel = safe_velocity_calculation(l_foot_pos, time_delta, use_extrapolation=True)
-    r_foot_vel = safe_velocity_calculation(r_foot_pos, time_delta, use_extrapolation=True)
-    
-    # Calculate foot accelerations for the new stance detection method.
-    l_foot_accel = safe_velocity_calculation(l_foot_vel, time_delta, use_extrapolation=True)
-    r_foot_accel = safe_velocity_calculation(r_foot_vel, time_delta, use_extrapolation=True)
-    
-    # Detect stance phases using the more robust, acceleration-based method.
-    l_stance = detect_stance_phases(l_foot_pos, l_foot_vel, l_foot_accel)
-    r_stance = detect_stance_phases(r_foot_pos, r_foot_vel, r_foot_accel)
-    
-    # Initialize transformed positions
-    transformed_centers = joint_centers.copy()
-    current_offset = np.zeros(3)
-    last_offset_update = np.zeros(3)
-
-    for frame in range(1, n_frames):
-        # Determine which foot (if any) is in stance for the current frame
-        in_double_stance = l_stance[frame] and r_stance[frame]
-        in_left_stance = l_stance[frame] and not r_stance[frame]
-        in_right_stance = r_stance[frame] and not l_stance[frame]
-        in_flight = not l_stance[frame] and not r_stance[frame]
-
-        offset_update = np.zeros(3)
-
-        if in_left_stance:
-            # To make the left foot stationary, the world must move by the inverse of the foot's displacement.
-            offset_update = -(l_foot_pos[frame] - l_foot_pos[frame - 1])
-        elif in_right_stance:
-            # To make the right foot stationary, the world must move by the inverse of the foot's displacement.
-            offset_update = -(r_foot_pos[frame] - r_foot_pos[frame - 1])
-        elif in_double_stance:
-            # In double stance, use the average displacement of both feet to minimize drift and create smooth motion.
-            avg_foot_now = (l_foot_pos[frame] + r_foot_pos[frame]) / 2.0
-            avg_foot_prev = (l_foot_pos[frame - 1] + r_foot_pos[frame - 1]) / 2.0
-            offset_update = -(avg_foot_now - avg_foot_prev)
-        elif in_flight:
-            # During flight, the character should continue with its last known velocity.
-            # This is achieved by re-applying the displacement from the last frame that had ground contact.
-            offset_update = last_offset_update
-        
-        # The transformation should only affect horizontal movement (X and Y axes).
-        # Vertical (Z) motion should be preserved from the original capture to maintain jump heights, etc.
-        offset_update[2] = 0.0
-
-        current_offset += offset_update
-        transformed_centers[frame, :, :] += current_offset
-
-        # If the character was on the ground, store the calculated displacement.
-        # This will be used to maintain momentum during the next flight phase.
-        if not in_flight:
-            last_offset_update = offset_update
-            
-    # Add the belt speed to achieve proper overground motion
-    # The belt moves at treadmill_speed, so the runner should move forward at that speed
-    duration = (n_frames - 1) / fps  # Total time duration
-    expected_forward_distance = treadmill_speed * duration
-    
-    # Calculate current forward displacement after transformation
-    pelvis_idx = joint_names.index('Pelvis') if 'Pelvis' in joint_names else 0
-    initial_pelvis_pos = joint_centers[0, pelvis_idx, :]
-    
-    # Add linear progression to achieve target forward speed
-    # This simulates the runner moving forward at belt speed
-    for frame in range(n_frames):
-        progress_ratio = frame / (n_frames - 1) if n_frames > 1 else 0
-        additional_forward_offset = expected_forward_distance * progress_ratio
-        transformed_centers[frame, :, 0] += additional_forward_offset
-    
-    # Final verification
-    final_pelvis_pos = transformed_centers[-1, pelvis_idx, :]
-    total_forward_dist = final_pelvis_pos[0] - initial_pelvis_pos[0]
-    
-    print(f"Applied transformation: pelvis moved {total_forward_dist:.3f}m forward in X direction.")
-    print(f"Expected distance for {treadmill_speed:.1f} m/s over {duration:.1f}s: {expected_forward_distance:.3f}m")
-    return transformed_centers
-
-
-def plot_pelvis_velocity_analysis(global_translations, joint_names, fps, treadmill_speed, save_path=None):
-    """
-    Plot pelvis velocity analysis to verify treadmill transformation is working correctly.
-    
-    Args:
-        global_translations: (n_frames, n_joints, 3) array of joint positions
-        joint_names: list of joint names
-        fps: frames per second
-        treadmill_speed: expected treadmill speed in m/s
-        save_path: optional path to save the plot
-    """
-    try:
-        pelvis_idx = joint_names.index('Pelvis') if 'Pelvis' in joint_names else 0
-        
-        # Calculate velocities using improved safe_velocity_calculation
-        time_delta = 1.0 / fps
-        pelvis_positions = global_translations[:, pelvis_idx, :]
-        
-        # Use the improved velocity calculation with extrapolation for better boundary handling
-        pelvis_velocities = safe_velocity_calculation(pelvis_positions, time_delta, use_extrapolation=True)
-        
-        # Time array
-        time_array = np.arange(len(pelvis_positions)) / fps
-        
-        # Create subplots
-        fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(15, 10))
-        fig.suptitle(f'Pelvis Motion Analysis (Treadmill Speed: {treadmill_speed:.1f} m/s)', fontsize=16)
-        
-        # Plot 1: Pelvis Position over time
-        ax1.plot(time_array, pelvis_positions[:, 0], 'r-', label='X (Forward)', linewidth=2)
-        ax1.plot(time_array, pelvis_positions[:, 1], 'g-', label='Y (Lateral)', linewidth=2)
-        ax1.plot(time_array, pelvis_positions[:, 2], 'b-', label='Z (Vertical)', linewidth=2)
-        ax1.set_xlabel('Time (s)')
-        ax1.set_ylabel('Position (m)')
-        ax1.set_title('Pelvis Position')
-        ax1.legend()
-        ax1.grid(True, alpha=0.3)
-        
-        # Plot 2: Pelvis Velocity over time
-        ax2.plot(time_array, pelvis_velocities[:, 0], 'r-', label='X (Forward)', linewidth=2)
-        ax2.plot(time_array, pelvis_velocities[:, 1], 'g-', label='Y (Lateral)', linewidth=2)
-        ax2.plot(time_array, pelvis_velocities[:, 2], 'b-', label='Z (Vertical)', linewidth=2)
-        ax2.axhline(y=treadmill_speed, color='black', linestyle='--', label=f'Target Speed ({treadmill_speed:.1f} m/s)')
-        ax2.set_xlabel('Time (s)')
-        ax2.set_ylabel('Velocity (m/s)')
-        ax2.set_title('Pelvis Velocity')
-        ax2.legend()
-        ax2.grid(True, alpha=0.3)
-        
-        # Plot 3: Forward velocity histogram
-        ax3.hist(pelvis_velocities[:, 0], bins=50, alpha=0.7, color='blue', edgecolor='black')
-        ax3.axvline(x=treadmill_speed, color='red', linestyle='--', linewidth=2, label=f'Target Speed ({treadmill_speed:.1f} m/s)')
-        ax3.axvline(x=np.mean(pelvis_velocities[:, 0]), color='green', linestyle='-', linewidth=2, label=f'Mean ({np.mean(pelvis_velocities[:, 0]):.2f} m/s)')
-        ax3.set_xlabel('Forward Velocity (m/s)')
-        ax3.set_ylabel('Frequency')
-        ax3.set_title('Forward Velocity Distribution')
-        ax3.legend()
-        ax3.grid(True, alpha=0.3)
-        
-        # Plot 4: Velocity statistics
-        stats_text = f"""
-Forward Velocity Statistics:
-Mean: {np.mean(pelvis_velocities[:, 0]):.3f} m/s
-Std:  {np.std(pelvis_velocities[:, 0]):.3f} m/s
-Min:  {np.min(pelvis_velocities[:, 0]):.3f} m/s
-Max:  {np.max(pelvis_velocities[:, 0]):.3f} m/s
-
-Target Speed: {treadmill_speed:.3f} m/s
-Error: {np.mean(pelvis_velocities[:, 0]) - treadmill_speed:.3f} m/s
-
-Lateral Velocity:
-Mean: {np.mean(pelvis_velocities[:, 1]):.3f} m/s
-Std:  {np.std(pelvis_velocities[:, 1]):.3f} m/s
-
-Vertical Velocity:
-Mean: {np.mean(pelvis_velocities[:, 2]):.3f} m/s
-Std:  {np.std(pelvis_velocities[:, 2]):.3f} m/s
-        """
-        
-        ax4.text(0.05, 0.95, stats_text, transform=ax4.transAxes, fontsize=10,
-                 verticalalignment='top', fontfamily='monospace',
-                 bbox=dict(boxstyle='round', facecolor='lightgray', alpha=0.8))
-        ax4.set_xlim(0, 1)
-        ax4.set_ylim(0, 1)
-        ax4.axis('off')
-        ax4.set_title('Velocity Statistics')
-        
-        plt.tight_layout()
-        
-        if save_path:
-            plt.savefig(save_path, dpi=300, bbox_inches='tight')
-            print(f"Pelvis velocity analysis plot saved to: {save_path}")
-        
-        plt.show()
-        
-        # Print summary to console
-        print("\n🔍 Pelvis Velocity Analysis:")
-        print(f"   Target treadmill speed: {treadmill_speed:.3f} m/s")
-        print(f"   Actual mean forward velocity: {np.mean(pelvis_velocities[:, 0]):.3f} m/s")
-        print(f"   Forward velocity std: {np.std(pelvis_velocities[:, 0]):.3f} m/s")
-        print(f"   Forward velocity range: {np.min(pelvis_velocities[:, 0]):.3f} to {np.max(pelvis_velocities[:, 0]):.3f} m/s")
-        
-        if abs(np.mean(pelvis_velocities[:, 0]) - treadmill_speed) < 0.1:
-            print("   ✅ Forward velocity is close to target speed")
-        else:
-            print("   ⚠️  Forward velocity differs significantly from target speed")
-            
-        if np.std(pelvis_velocities[:, 0]) > 0.1:
-            print("   ✅ Forward velocity shows natural variation (not pinned)")
-        else:
-            print("   ⚠️  Forward velocity appears too constant (possibly pinned)")
-        
-    except Exception as e:
-        print(f"Error in pelvis velocity analysis: {e}")
-
-
 # --- Data Loading and Main Execution ---
 
-def create_motion_from_txt(motion_filepath: str, tpose_filepath: str, treadmill_speed: float, mocap_fr: int = 200, debug_file: Path = None):
-    """Loads and parses your specific .txt file format using pandas for robustness."""
+def create_motion_from_txt(motion_filepath: str, rotation_filepath: str, tpose_filepath: str, tpose_rotation_filepath: str, treadmill_speed: float, mocap_fr: int = 200, debug_file: Optional[Path] = None, coordinate_transform: str = "y_to_x_forward"):
+    """
+    Loads motion data from position and quaternion files from biomechanics software.
+    
+    IMPORTANT: Quaternion format expectations:
+    - All quaternions in WXYZ format (scalar-first: [w, x, y, z])
+    - Pelvis quaternion: Global rotation (pelvis → lab coordinate system)
+    - Other joint quaternions: Local rotations (parent bone → child bone)
+    
+    Args:
+        motion_filepath: Path to .txt file with joint positions[x, y, z] format. txt is without headers but has frame numbers in first column. Joint order: Pelvis, L_Hip, L_Knee, L_Ankle, L_Toe, R_Hip, R_Knee, R_Ankle, R_Toe.
+        rotation_filepath: Path to .txt file with joint quaternions [w, x, y, z] format (WXYZ - scalar first). Pelvis=global rotation, others=local rotations (parent→child). txt is without headers but has frame numbers in first column. Joint order: Pelvis, L_Hip, L_Knee, L_Ankle, L_Toe, R_Hip, R_Knee, R_Ankle, R_Toe.
+        tpose_filepath: Path to T-pose .txt file with positions[x, y, z] format. txt is without headers but has frame numbers in first column. Joint order: Pelvis, L_Hip, L_Knee, L_Ankle, L_Toe, R_Hip, R_Knee, R_Ankle, R_Toe.
+        tpose_rotation_filepath: Path to T-pose .txt file with quaternions [w, x, y, z] format (WXYZ - scalar first). txt is without headers but has frame numbers in first column. Joint order: Pelvis, L_Hip, L_Knee, L_Ankle, L_Toe, R_Hip, R_Knee, R_Ankle, R_Toe.
+        treadmill_speed: Speed of treadmill for transformation
+        mocap_fr: Frame rate of motion capture data
+        debug_file: Optional debug file path
+        coordinate_transform: Coordinate system transformation to apply
+            - "none": No transformation (X=right, Y=forward, Z=up)
+            - "y_to_x_forward": Rotate 90° around Z to change Y=forward to X=forward (default)
+        
+    Returns:
+        SimpleMotion: Motion object with positions and local_rotation quaternions ready for retargeting
+    """
     print(f"Loading motion data from {motion_filepath}...")
     
-    with open(motion_filepath, 'r') as f:
-        lines = f.readlines()
-        header_line = lines[1]
-        raw_names = [name for name in header_line.strip().split('\t') if name]
-        joint_names = []
-        for name in raw_names:
-            if name not in joint_names:
-                joint_names.append(name)
-    print(f"Parsed joint names from file: {joint_names}")
+    # Define joint names based on the order specified in the docstring
+    # Joint order: Pelvis, L_Hip, L_Knee, L_Ankle, L_Toe, R_Hip, R_Knee, R_Ankle, R_Toe
+    joint_names = ['Pelvis', 'L_Hip', 'L_Knee', 'L_Ankle', 'L_Toe', 'R_Hip', 'R_Knee', 'R_Ankle', 'R_Toe']
+    print(f"Using predefined joint names: {joint_names}")
 
-    motion_df = pd.read_csv(motion_filepath, sep='\t', header=4)
-    motion_raw_data = motion_df.iloc[:, 1:].to_numpy()
+    motion_df = pd.read_csv(motion_filepath, sep='\t', header=None)
+    motion_raw_data = motion_df.iloc[:, 1:].to_numpy()  # Skip first column (frame numbers)
     joint_centers = motion_raw_data.reshape((motion_raw_data.shape[0], -1, 3))
 
-    print(f"Loading T-pose data from {tpose_filepath}...")
-    tpose_df = pd.read_csv(tpose_filepath, sep='\t', header=4)
-    tpose_positions = tpose_df.iloc[0, 1:].to_numpy().reshape(-1, 3)
+    print(f"Loading T-pose position data from {tpose_filepath}...")
+    tpose_df = pd.read_csv(tpose_filepath, sep='\t', header=None)
+    tpose_positions = tpose_df.iloc[0, 1:].to_numpy().reshape(-1, 3)  # Skip first column (frame numbers)
     
-    # Apply coordinate system rotation: Y->X, X->-Y to align with robot's +X forward direction
-    print("Applying coordinate system rotation to align with robot orientation...")
-    joint_centers_rotated = joint_centers.copy()
+    print(f"Loading T-pose quaternion data from {tpose_rotation_filepath}...")
+    tpose_rotation_df = pd.read_csv(tpose_rotation_filepath, sep='\t', header=None)
+    tpose_rotation_raw = tpose_rotation_df.iloc[0, 1:].to_numpy()  # Skip first column (frame numbers)
+    tpose_quaternions = tpose_rotation_raw.reshape(-1, 4)  # [w, x, y, z] format
+    print(f"Loaded T-pose quaternions for {tpose_quaternions.shape[0]} joints")
     
-    # Apply 90-degree rotation around Z-axis: (x,y,z) -> (y,-x,z)
-    # This transforms Y-forward motion data to X-forward robot orientation
-    joint_centers_rotated[:, :, 0] = joint_centers[:, :, 1]   # New X = Old Y
-    joint_centers_rotated[:, :, 1] = -joint_centers[:, :, 0]  # New Y = -Old X  
-    joint_centers_rotated[:, :, 2] = joint_centers[:, :, 2]   # Z stays the same
-    joint_centers = joint_centers_rotated
+    # Validate quaternion format - WXYZ quaternions should have reasonable magnitudes
+    print("Validating T-pose quaternion format (expecting WXYZ [w, x, y, z])...")
+    for i in range(min(3, tpose_quaternions.shape[0])):
+        quat = tpose_quaternions[i]
+        magnitude = np.linalg.norm(quat)
+        print(f"  {joint_names[i]}: [{quat[0]:.3f}, {quat[1]:.3f}, {quat[2]:.3f}, {quat[3]:.3f}], mag: {magnitude:.3f}")
+        
+        if abs(magnitude - 1.0) > 0.1:
+            print(f"  ⚠️  Warning: {joint_names[i]} quaternion magnitude {magnitude:.3f} is not close to 1.0")
+            print("      This might indicate incorrect quaternion format or data corruption")
+
+    # Apply coordinate system transformation if requested
+    if coordinate_transform == "y_to_x_forward":
+        print("Applying coordinate transformation: Y=forward → X=forward (rotating -90° around Z-axis)")
+        
+        # Rotate positions: [x, y, z] → [y, -x, z] (90° counter-clockwise around Z)
+        joint_centers_transformed = joint_centers.copy()
+        joint_centers_transformed[:, :, 0] = joint_centers[:, :, 1]   # new X = old Y
+        joint_centers_transformed[:, :, 1] = -joint_centers[:, :, 0]  # new Y = -old X
+        joint_centers = joint_centers_transformed
+        
+        # Transform T-pose positions the same way
+        tpose_positions_transformed = tpose_positions.copy()
+        tpose_positions_transformed[:, 0] = tpose_positions[:, 1]   # new X = old Y
+        tpose_positions_transformed[:, 1] = -tpose_positions[:, 0]  # new Y = -old X
+        tpose_positions = tpose_positions_transformed
+        
+        print("  ✅ Coordinate transformation applied to positions")
+    elif coordinate_transform == "none":
+        print("No coordinate transformation applied (keeping X=right, Y=forward, Z=up)")
+    else:
+        print(f"Warning: Unknown coordinate transform '{coordinate_transform}', skipping transformation")
+
+    # Apply ground plane adjustment to ensure feet contact the ground
+    print("Applying ground plane adjustment...")
     
-    # Also rotate T-pose positions with the same transformation
-    tpose_positions_rotated = tpose_positions.copy()
-    tpose_positions_rotated[:, 0] = tpose_positions[:, 1]   # New X = Old Y
-    tpose_positions_rotated[:, 1] = -tpose_positions[:, 0]  # New Y = -Old X
-    tpose_positions_rotated[:, 2] = tpose_positions[:, 2]   # Z stays the same
-    tpose_positions = tpose_positions_rotated
+    # Find the lowest point across all frames and joints (should be foot contact points)
+    min_z_across_motion = np.min(joint_centers[:, :, 2])
     
-    # Debug: Check if transformation preserved left-right symmetry
-    if 'L_Hip' in joint_names and 'R_Hip' in joint_names:
-        l_hip_idx = joint_names.index('L_Hip')
-        r_hip_idx = joint_names.index('R_Hip')
-        l_hip_pos = joint_centers[0, l_hip_idx, :]
-        r_hip_pos = joint_centers[0, r_hip_idx, :]
-        print(f"After rotation - L_Hip: {l_hip_pos}, R_Hip: {r_hip_pos}")
-        print(f"Hip separation (Y-axis): {r_hip_pos[1] - l_hip_pos[1]:.3f}")
-        if abs(r_hip_pos[1] - l_hip_pos[1]) < 0.1:
-            print("⚠️  Warning: Hips appear too close in Y-axis, check coordinate transformation")
+    # Adjust all joints so the lowest point touches z=0
+    ground_offset = -min_z_across_motion
+    joint_centers[:, :, 2] += ground_offset
+    tpose_positions[:, 2] += ground_offset
+    
+    print(f"  ✅ Adjusted motion by {ground_offset:.3f}m vertically to place feet on ground plane")
+    print(f"  Motion Z-range: [{np.min(joint_centers[:, :, 2]):.3f}, {np.max(joint_centers[:, :, 2]):.3f}]m")
 
     # Apply treadmill-to-overground transformation if a non-zero treadmill speed is given.
     if treadmill_speed > 0:
-        joint_centers = transform_treadmill_to_overground(joint_centers, joint_names, mocap_fr, treadmill_speed)
+        # Determine forward axis based on coordinate transformation
+        forward_axis = 0 if coordinate_transform == "y_to_x_forward" else 1  # X=0 after transformation, Y=1 before
+        joint_centers = transform_treadmill_to_overground(joint_centers, joint_names, mocap_fr, treadmill_speed, forward_axis)
 
     if debug_file:
+        # save a copy of the processed joint centers for debugging with a name that indicates it's post-transformation
+        debug_file = debug_file.with_name(debug_file.stem + "_treadmill_transform.npz")
         np.savez(debug_file, body_positions=joint_centers, body_names=joint_names, fps=mocap_fr)
         print(f"Saved debug data to: {debug_file}")
 
+    # Create skeleton tree WITH all 9 joints (including pelvis for retargeting compatibility)
+    # Keep original joint structure to match retargeting expectations
     parents = [-1, 0, 1, 2, 3, 0, 5, 6, 7]
     
+    # Use T-pose positions for proper bone lengths
     local_translations = np.zeros_like(tpose_positions)
     for i, p_idx in enumerate(parents):
         if p_idx == -1:
@@ -915,30 +202,77 @@ def create_motion_from_txt(motion_filepath: str, tpose_filepath: str, treadmill_
             local_translations[i] = tpose_positions[i] - tpose_positions[p_idx]
             
     skeleton_tree = SkeletonTree(joint_names, torch.tensor(parents), torch.from_numpy(local_translations).float())
+    print(f"Created skeleton tree with all joints: {len(joint_names)} joints")
 
-    # Create proper rotations for all joints and frames
-    num_frames, num_joints = joint_centers.shape[0], len(joint_names)
-    # Create rotations with proper upright orientation
-    dummy_rotations = torch.zeros(num_frames, num_joints, 4)
-    dummy_rotations[:, :, 0] = 1.0  # Set w component to 1 for identity quaternions
+    # Load quaternion data from biomechanics software
+    print(f"Loading quaternion data from {rotation_filepath}...")
+    rotation_df = pd.read_csv(rotation_filepath, sep='\t', header=None)
+    rotation_raw_data = rotation_df.iloc[:, 1:].to_numpy()  # Skip first column (frame numbers)
     
-    # Fix the root (Pelvis) orientation to be upright
-    # The coordinate transform we applied earlier (Y->X, X->-Y) might have affected orientation
-    # Let's ensure the pelvis has proper upright orientation
-    pelvis_idx = 0  # Pelvis is the first joint
-    # Identity quaternion should work, but if the robot is upside down, we might need a rotation
-    # For now, keep identity and we'll debug further if needed
+    # Validate motion quaternion format
+    print("Validating motion quaternion format (expecting WXYZ [w, x, y, z])...")
+    motion_quaternions_sample = rotation_raw_data.reshape((rotation_raw_data.shape[0], -1, 4))
+    for i in range(min(3, motion_quaternions_sample.shape[1])):
+        # Check first frame quaternion for each joint
+        quat = motion_quaternions_sample[0, i]
+        magnitude = np.linalg.norm(quat)
+        print(f"  {joint_names[i]} (frame 0): [{quat[0]:.3f}, {quat[1]:.3f}, {quat[2]:.3f}, {quat[3]:.3f}], mag: {magnitude:.3f}")
+        
+        if abs(magnitude - 1.0) > 0.1:
+            print(f"  ⚠️  Warning: {joint_names[i]} frame 0 quaternion magnitude {magnitude:.3f} is not close to 1.0")
+            print("      This might indicate incorrect quaternion format or data corruption")
+    
+    # Process quaternion data 
+    # Your data format: Pelvis = global rotation, Others = local rotations (parent→child)
+    # Convert to ALL local rotations for poselib compatibility
+    motion_quaternions = rotation_raw_data.reshape((rotation_raw_data.shape[0], -1, 4))
+    
+    # Convert pelvis from global to local (relative to T-pose)
+    print("Converting pelvis from global to local rotation...")
+    pelvis_global = motion_quaternions[:, 0, :]  # Pelvis quaternions (global)
+    pelvis_tpose = tpose_quaternions[0]  # Pelvis T-pose (global)
+    
+    # Convert to local: local = global * tpose_inverse
+    for frame in range(motion_quaternions.shape[0]):
+        global_quat = pelvis_global[frame]
+        # Convert [w,x,y,z] to scipy format [x,y,z,w]
+        global_scipy = [global_quat[1], global_quat[2], global_quat[3], global_quat[0]]
+        tpose_scipy = [pelvis_tpose[1], pelvis_tpose[2], pelvis_tpose[3], pelvis_tpose[0]]
+        
+        global_rot = R.from_quat(global_scipy)
+        tpose_rot = R.from_quat(tpose_scipy)
+        
+        # Local = global * tpose^(-1)
+        local_rot = global_rot * tpose_rot.inv()
+        local_quat_scipy = local_rot.as_quat()  # [x,y,z,w]
+        
+        # Convert back to [w,x,y,z] format
+        motion_quaternions[frame, 0] = [local_quat_scipy[3], local_quat_scipy[0], 
+                                        local_quat_scipy[1], local_quat_scipy[2]]
+    
+    joint_rotations = torch.from_numpy(motion_quaternions).float()
+    print(f"Converted to ALL local rotations: {joint_rotations.shape[0]} frames and {joint_rotations.shape[1]} joints")
 
+    # Keep ALL joint data together (including pelvis) for retargeting compatibility
+    print("Using all joint data (including pelvis) for proper retargeting...")
+    
+    # Convert all data to tensors for poselib compatibility
+    all_joint_positions = torch.from_numpy(joint_centers).float()  # All 9 joints
+    all_joint_rotations = joint_rotations  # Already tensor, all 9 joints
+    
+    print(f"All joints: {all_joint_positions.shape[1]} joints x {all_joint_positions.shape[0]} frames")
+    print(f"Joint names: {joint_names}")
+    
+    # Create motion object with all joint data (retargeting will handle pelvis as root internally)
     motion = SimpleMotion(
-        global_translation=torch.from_numpy(joint_centers).float(),
-        global_rotation=dummy_rotations,
+        global_translation=all_joint_positions,  # All joint positions (9 joints)
+        global_rotation=all_joint_rotations,     # All joint rotations (9 joints, local format)
+        local_rotation=all_joint_rotations,      # Same as global_rotation (local format)
         skeleton_tree=skeleton_tree,
         fps=mocap_fr
     )
-    
     print("Motion object created successfully.")
     return motion
-
 
 def extrapolate_boundaries(data, n_extrapolate=2):
     """
@@ -1120,413 +454,68 @@ def safe_angular_velocity_calculation(quaternions, time_delta):
 
 def main(
     motion_file: Path = typer.Argument(..., help="Path to your .txt motion file."),
+    rotation_file: Path = typer.Argument(..., help="Path to your .txt quaternion file [w, x, y, z] format."),
     tpose_file: Path = typer.Argument(..., help="Path to your T-pose .txt file."),
+    tpose_rotation_file: Path = typer.Argument(..., help="Path to your T-pose quaternion .txt file [w, x, y, z] format."),
     output_file: Path = typer.Argument(..., help="Path to save the output .npy file."),
     robot_xml: Path = typer.Argument(..., help="Path to your robot's .xml file."),
     treadmill_speed: float = typer.Option(3.0, help="Treadmill speed in m/s."),
+    coordinate_transform: str = typer.Option("y_to_x_forward", help="Coordinate system transformation: 'none' (X=right, Y=forward) or 'y_to_x_forward' (Y=forward → X=forward)"),
     render: bool = typer.Option(False, help="Enable live rendering of the retargeting process."),
-    debug_file: Path = typer.Option(None, help="Path to save the debug .npz file."),
+    debug_file: Optional[Path] = typer.Option(None, help="Path to save the debug .npz file."),
 ):
     """
-    This script retargets motion from a text file of 3D joint positions to a
+    This script retargets motion from text files of 3D joint positions and quaternions to a
     lower-body humanoid robot for use in Isaac Lab.
+    
+    Both motion and T-pose rotation files should contain quaternions in [w, x, y, z] format (scalar-first).
+    The script computes relative rotations from T-pose to each motion frame, providing
+    accurate joint angles relative to the anatomical reference configuration.
+    
+    Coordinate System Options:
+    - 'none': Keep original coordinate system (X=right, Y=forward, Z=up)
+    - 'y_to_x_forward': Transform to robotics convention (X=forward, Y=left, Z=up)
+    
+    This approach uses quaternion data directly from biomechanics software with
+    T-pose reference for the most accurate joint orientations.
     """
     robot_type = "smpl_humanoid_lower_body"
 
-    source_motion = create_motion_from_txt(str(motion_file), str(tpose_file), treadmill_speed, debug_file=debug_file)
-    
-    print("Skipping rotation computation - using IK solver to determine joint rotations from positions")
-    
-    if render:
-        print("Debug: First frame positions being sent to IK solver:")
-        for i, name in enumerate(source_motion.skeleton_tree.node_names):
-            print(f"  {name}: {source_motion.global_translation[0, i, :].numpy()}")
-    
-    # FIXED: Since rotation computation from positions is problematic, let's use IK retargeting
-    # but provide it with the correct position targets from our transformed motion data
-    print("Using IK retargeting with position targets from transformed motion data...")
-    
-    # Use IK for position refinement - this should work better than trying to compute rotations
-    poses, trans = retarget_motion(source_motion, robot_type, str(robot_xml), render)
+    source_motion = create_motion_from_txt(str(motion_file), str(rotation_file), str(tpose_file), str(tpose_rotation_file), treadmill_speed, debug_file=debug_file, coordinate_transform=coordinate_transform)
 
-    print("\nConverting to final SMPL-like format...")
+    # Retarget the motion to the target robot using Mink
+    print(f"Retargeting motion to {robot_type} using Mink...")
+    retargeted_motion = retarget_motion_to_robot(source_motion, robot_type, render=render)
     
-    # CRITICAL: Use the IK results for root translation, not the original motion data
-    # The IK solver computed proper positions that work with the robot
-    root_translation = torch.from_numpy(trans[:, :3]).double()  # Use IK root positions
+    # Save debug NPZ file after retargeting for visualization
+    if debug_file:
+        retarget_debug_file = debug_file.with_name(debug_file.stem + "_retargeted")
+        retargeted_positions = retargeted_motion.global_translation.numpy()
+        retargeted_joint_names = retargeted_motion.skeleton_tree.node_names
+        np.savez(
+            retarget_debug_file, 
+            body_positions=retargeted_positions, 
+            body_names=retargeted_joint_names, 
+            fps=retargeted_motion.fps
+        )
+        print(f"Saved retargeted debug data to: {retarget_debug_file}")
+        print(f"You can visualize this with: python data/scripts/debug_motion_viewer.py --file {retarget_debug_file}")
     
-    print(f"Debug: Using IK root positions instead of original motion data")
-    print(f"Debug: IK root position range: {trans[:, :3].min():.3f} to {trans[:, :3].max():.3f}")
-    
-    # Also use the original for comparison
-    transformed_global_translations = source_motion.global_translation.numpy()
-    pelvis_idx = source_motion.skeleton_tree.node_names.index('Pelvis') if 'Pelvis' in source_motion.skeleton_tree.node_names else 0
-    original_pelvis_positions = transformed_global_translations[:, pelvis_idx, :].copy()
-    
-    # Debug: Print pelvis movement to verify transformation is preserved
-    ik_pelvis_start = trans[0, :3]
-    ik_pelvis_end = trans[-1, :3]
-    ik_total_movement = ik_pelvis_end - ik_pelvis_start
-    print(f"Debug: IK Pelvis movement - Start: {ik_pelvis_start}, End: {ik_pelvis_end}")
-    print(f"Debug: IK Total pelvis displacement: {ik_total_movement}, Forward distance: {ik_total_movement[0]:.3f}m")
-    print(f"Debug: IK Pelvis height range: {trans[:, 2].min():.3f}m to {trans[:, 2].max():.3f}m")
-    
-    # Compare with original
-    orig_pelvis_start = original_pelvis_positions[0, :]
-    orig_pelvis_end = original_pelvis_positions[-1, :]
-    orig_total_movement = orig_pelvis_end - orig_pelvis_start
-    print(f"Debug: Original Pelvis movement - Start: {orig_pelvis_start}, End: {orig_pelvis_end}")
-    print(f"Debug: Original Total pelvis displacement: {orig_total_movement}, Forward distance: {orig_total_movement[0]:.3f}m")
-    
-    # Correct DOF mapping based on the actual XML structure
-    joint_dof_map: List[Dict[str, Any]] = [
-        {'name': 'L_Hip', 'dof': 3},
-        {'name': 'L_Knee', 'dof': 3},  # Now has x, y, z axes
-        {'name': 'L_Ankle', 'dof': 3},
-        {'name': 'L_Toe', 'dof': 3},   # Now has x, y, z axes
-        {'name': 'R_Hip', 'dof': 3},
-        {'name': 'R_Knee', 'dof': 3},  # Now has x, y, z axes
-        {'name': 'R_Ankle', 'dof': 3},
-        {'name': 'R_Toe', 'dof': 3}    # Now has x, y, z axes
-    ]
-
-    # Check DOF consistency
-    actual_dofs = sum(j['dof'] for j in joint_dof_map)
-    # The IK solver seems to be returning 25 DOFs, which suggests it's handling the free joint differently
-    # Let's accept what the IK solver returns and adjust our expectations
-    if poses.shape[1] != 25:
-        print(f"Warning: Expected 25 DOFs from IK solver, but got {poses.shape[1]}")
-        # For now, let's proceed with what we have
-    else:
-        print(f"✅ DOF consistency check passed: IK solver returned {poses.shape[1]} DOFs as expected")
-
-    # Convert poses to PyTorch tensor first
-    poses = torch.from_numpy(poses).double()
-    
-    # IMPORTANT: Use the IK results, not the dummy rotations!
-    # The IK solver computed proper joint rotations in the 'poses' array
-    # We need to convert these back to quaternions for the motion file
-    
-    print(f"Debug: Using IK results - poses shape: {poses.shape}")
-    print(f"Debug: trans shape: {trans.shape}")
-    print(f"Debug: Sample pose values: {poses[0, :6]}")  # First 6 DOFs
-    print(f"Debug: Sample trans values: {trans[0]}")     # First frame
-    
-    # Use the root rotation from the IK results (trans contains [pos_x, pos_y, pos_z, quat_w, quat_x, quat_y, quat_z])
-    root_rotation_quat = torch.from_numpy(trans[:, 3:]).double()  # Extract quaternion part
-    
-    # Convert IK joint angles to quaternions
-    # The poses array contains joint angles that need to be converted to quaternions
-    num_frames, num_joints = source_motion.global_translation.shape[0], len(source_motion.skeleton_tree.node_names)
-    full_rotation = torch.zeros(num_frames, num_joints, 4).double()
-    
-    # Set the root rotation from IK results
-    full_rotation[:, 0, :] = root_rotation_quat  # Pelvis is joint 0
-    
-    # Convert joint angles to quaternions
-    # The poses array has shape (num_frames, 25) where the first 6 are root DOFs and the rest are joint angles
-    # We need to convert the joint angles (indices 6-24) to quaternions
-    joint_angles = poses[:, 6:].numpy()  # Extract joint angles (19 DOFs)
-    
-    print(f"Debug: Converting {joint_angles.shape[1]} joint angles to quaternions")
-    print(f"Debug: Joint angle range: {joint_angles.min():.3f} to {joint_angles.max():.3f}")
-    
-    # Convert joint angles to quaternions using axis-angle representation
-    # Each joint has 3 DOFs (x, y, z rotations), so we need to combine them
-    from scipy.spatial.transform import Rotation as R
-    
-    for frame in range(num_frames):
-        angle_idx = 0
-        for joint_idx in range(1, num_joints):  # Skip root (joint 0)
-            if angle_idx + 2 < joint_angles.shape[1]:  # Ensure we have 3 angles
-                # Extract the 3 angles for this joint
-                angles = joint_angles[frame, angle_idx:angle_idx + 3]
-                
-                # Convert to rotation matrix using Euler angles (XYZ order)
-                # Note: The order matters - we'll use XYZ as that's common for joint rotations
-                try:
-                    # Create rotation from Euler angles (XYZ order)
-                    rot = R.from_euler('xyz', angles, degrees=False)
-                    quat = rot.as_quat()  # Returns [x, y, z, w]
-                    
-                    # Convert to [w, x, y, z] format for poselib
-                    full_rotation[frame, joint_idx, 0] = quat[3]  # w
-                    full_rotation[frame, joint_idx, 1] = quat[0]  # x
-                    full_rotation[frame, joint_idx, 2] = quat[1]  # y
-                    full_rotation[frame, joint_idx, 3] = quat[2]  # z
-                    
-                    if frame == 0:
-                        print(f"Debug: Joint {joint_idx} ({source_motion.skeleton_tree.node_names[joint_idx]}): angles={angles}, quat={quat}")
-                        
-                except Exception as e:
-                    print(f"Warning: Failed to convert joint {joint_idx} angles {angles}: {e}")
-                    # Fallback to identity
-                    full_rotation[frame, joint_idx, 0] = 1.0  # w
-                    full_rotation[frame, joint_idx, 1:4] = 0.0  # x, y, z
-                
-                angle_idx += 3
-            else:
-                # Not enough angles, use identity
-                full_rotation[frame, joint_idx, 0] = 1.0  # w
-                full_rotation[frame, joint_idx, 1:4] = 0.0  # x, y, z
-
-    time_delta = 1.0 / source_motion.fps
-    
-    # Use the IK results for velocity calculation instead of original motion data
-    ik_root_positions = trans[:, :3]
-    ik_root_velocity = torch.from_numpy(safe_velocity_calculation(ik_root_positions, time_delta, use_extrapolation=True)).double()
-
-    # Debug: Check IK pelvis velocity specifically
-    print(f"Debug: IK Pelvis velocity range - X: {ik_root_velocity[:, 0].min():.3f} to {ik_root_velocity[:, 0].max():.3f} m/s")
-    print(f"Debug: IK Pelvis velocity range - Y: {ik_root_velocity[:, 1].min():.3f} to {ik_root_velocity[:, 1].max():.3f} m/s")
-    print(f"Debug: IK Pelvis velocity range - Z: {ik_root_velocity[:, 2].min():.3f} to {ik_root_velocity[:, 2].max():.3f} m/s")
-    print(f"Debug: IK Average forward (X) velocity: {ik_root_velocity[:, 0].mean():.3f} m/s")
-    
-    # For the global velocity, we need to create a full set including all joints
-    # For now, use the original joint positions but with IK root velocity
-    global_velocity_raw = torch.from_numpy(safe_velocity_calculation(transformed_global_translations, time_delta, use_extrapolation=True)).double()
-    # Replace the root (pelvis) velocity with IK results
-    global_velocity_raw[:, pelvis_idx, :] = ik_root_velocity
-    
-    # Plot pelvis velocity analysis for verification
-    plot_pelvis_velocity_analysis(transformed_global_translations,
-                                  source_motion.skeleton_tree.node_names,
-                                  source_motion.fps,
-                                  treadmill_speed)
-    
-    if global_velocity_raw.shape[1] == 9:
-        global_velocity = global_velocity_raw  # Include all 9 joints including Pelvis
-    else:
-        raise ValueError(f"Unexpected number of joints in global velocity: {global_velocity_raw.shape[1]}")
-    
-    angular_velocity = torch.from_numpy(safe_angular_velocity_calculation(full_rotation.numpy(), time_delta)).double()
-
-    # Final sanity checks and quaternion normalization
-    for name, tensor in [("full_rotation", full_rotation), ("root_translation", root_translation),
-                         ("global_velocity", global_velocity), ("angular_velocity", angular_velocity)]:
-        if not torch.all(torch.isfinite(tensor)):
-            print(f"Warning: Non-finite values in {name}, replacing with zeros")
-            tensor = torch.nan_to_num(tensor, nan=0.0, posinf=0.0, neginf=0.0)
-        
-        # Special handling for quaternions (full_rotation)
-        if name == "full_rotation":
-            # Normalize quaternions to ensure they are unit quaternions
-            quat_norms = torch.norm(tensor, dim=-1, keepdim=True)
-            # Avoid division by zero
-            quat_norms = torch.clamp(quat_norms, min=1e-6)
-            tensor = tensor / quat_norms
-            print(f"✅ Normalized quaternions in {name}")
-
-    # Debug: Print some motion data to verify it's not all zeros
-    print("\nMotion data verification:")
-    print(f"  Root translation range: {root_translation.min():.6f} to {root_translation.max():.6f}")
-    print(f"  Root rotation range: {root_rotation_quat.min():.6f} to {root_rotation_quat.max():.6f}")
-    print(f"  Global velocity range: {global_velocity.min():.6f} to {global_velocity.max():.6f}")
-    print(f"  Angular velocity range: {angular_velocity.min():.6f} to {angular_velocity.max():.6f}")
-    print(f"  Root Height: {root_translation[:, 2].mean():.3f} m")
-
-    # Check if motion has meaningful content
-    if torch.allclose(root_translation, torch.zeros_like(root_translation), atol=1e-6):
-        print("⚠️  Warning: Root translation appears to be all zeros!")
-    if torch.allclose(root_rotation_quat, torch.zeros_like(root_rotation_quat), atol=1e-6):
-        print("⚠️  Warning: Root rotation appears to be all zeros!")
-    else:
-        print("✅ Root rotation has meaningful data!")
-
-    # Create the output data in the format expected by SkeletonMotion.from_file()
+    # Save the retargeted motion with numpy arrays (not dicts) for np.savez compatibility
+    print(f"Saving retargeted motion to {output_file}")
     output_data = OrderedDict([
-        ("rotation", tensor_to_dict(full_rotation)),
-        ("root_translation", tensor_to_dict(root_translation)),
-        ("global_velocity", tensor_to_dict(global_velocity)),
-        ("global_angular_velocity", tensor_to_dict(angular_velocity)),
-        ("skeleton_tree", source_motion.skeleton_tree.to_dict()),
-        ("is_local", False),
-        ("fps", np.array(source_motion.fps, dtype=np.float64)),
-        ("__name__", "SkeletonMotion")
+        ("rotation", retargeted_motion.global_rotation.numpy()),
+        ("root_translation", retargeted_motion.root_translation.numpy()),  
+        ("global_velocity", retargeted_motion.global_velocity.numpy()),
+        ("global_angular_velocity", retargeted_motion.global_angular_velocity.numpy()),
+        # Note: Skeleton tree saved separately due to its complex structure
+        ("fps", np.array(retargeted_motion.fps, dtype=np.float64)),
+        ("is_local", np.array(False)),
     ])
 
-    print(f"Saving {poses.shape[0]} frames of retargeted motion to: {output_file}")
-    np.save(output_file, output_data, allow_pickle=True)
+    print(f"Saving {retargeted_motion.global_rotation.shape[0]} frames of retargeted motion to: {output_file}")
+    np.savez(output_file, **output_data)
 
-    # Save debug file for visualization with debug_motion_viewer.py
-    debug_output_file = output_file.parent / f"{output_file.stem}_debug.npz"
-    print(f"Saving debug visualization file to: {debug_output_file}")
-    
-    # Reconstruct global positions from the IK results for visualization
-    # We need to convert the IK poses back to global positions
-    debug_positions = np.zeros((poses.shape[0], len(source_motion.skeleton_tree.node_names), 3))
-    
-    # Use the IK root positions for pelvis
-    debug_positions[:, 0, :] = trans[:, :3]  # Pelvis from IK root
-    
-    # Get original positions for fallback
-    original_positions = source_motion.global_translation.numpy()
-    
-    # For other joints, we need to reconstruct from the IK poses
-    # This is more complex but will show us what the IK solver actually computed
-    print(f"Reconstructing joint positions from IK poses...")
-    
-    # Load the robot model to get the forward kinematics
-    model = construct_model(str(robot_xml), source_motion.skeleton_tree.node_names)
-    data = mujoco.MjData(model)
-    
-    for frame in range(poses.shape[0]):
-        # Set the robot state to the IK solution
-        data.qpos[:3] = trans[frame, :3]  # Root position
-        data.qpos[3:7] = trans[frame, 3:7]  # Root quaternion
-        
-        # Handle joint angles with proper shape matching
-        joint_angles = poses[frame, 6:].numpy()  # Joint angles from IK
-        expected_joints = len(data.qpos[7:])  # Expected number of joint DOFs
-        
-        if len(joint_angles) == expected_joints:
-            data.qpos[7:] = joint_angles
-        elif len(joint_angles) < expected_joints:
-            # Pad with zeros if IK returned fewer DOFs
-            padded_angles = np.zeros(expected_joints)
-            padded_angles[:len(joint_angles)] = joint_angles
-            data.qpos[7:] = padded_angles
-        else:
-            # Truncate if IK returned more DOFs
-            data.qpos[7:] = joint_angles[:expected_joints]
-        
-        # Forward kinematics to get joint positions
-        mujoco.mj_forward(model, data)
-        
-        # Extract joint positions from the model
-        for joint_idx, joint_name in enumerate(source_motion.skeleton_tree.node_names):
-            if joint_name == 'Pelvis':
-                # Use the root position directly
-                debug_positions[frame, joint_idx, :] = data.qpos[:3]
-            else:
-                # Get the body position for this joint
-                try:
-                    body_id = model.body(joint_name).id
-                    debug_positions[frame, joint_idx, :] = data.xpos[body_id]
-                except:
-                    # Fallback: use the original relative positions
-                    relative_pos = original_positions[frame, joint_idx, :] - original_positions[frame, 0, :]
-                    debug_positions[frame, joint_idx, :] = debug_positions[frame, 0, :] + relative_pos
-    
-    debug_data = {
-        "body_positions": debug_positions,
-        "body_names": source_motion.skeleton_tree.node_names,
-        "fps": source_motion.fps
-    }
-    
-    np.savez(debug_output_file, **debug_data)
-    print(f"✅ Debug file saved! You can visualize it with:")
-    print(f"   python data/scripts/debug_motion_viewer.py --file {debug_output_file}")
-    
-    # ===== IK vs Original Motion Analysis =====
-    print("\n" + "="*60)
-    print("IK vs ORIGINAL MOTION ANALYSIS")
-    print("="*60)
-    
-    # Compare root positions
-    original_root_pos = original_pelvis_positions
-    ik_root_pos = trans[:, :3]
-    
-    print(f"\n📊 ROOT POSITION COMPARISON:")
-    print(f"Original root range: X[{original_root_pos[:, 0].min():.3f}, {original_root_pos[:, 0].max():.3f}], "
-          f"Y[{original_root_pos[:, 1].min():.3f}, {original_root_pos[:, 1].max():.3f}], "
-          f"Z[{original_root_pos[:, 2].min():.3f}, {original_root_pos[:, 2].max():.3f}]")
-    print(f"IK root range:      X[{ik_root_pos[:, 0].min():.3f}, {ik_root_pos[:, 0].max():.3f}], "
-          f"Y[{ik_root_pos[:, 1].min():.3f}, {ik_root_pos[:, 1].max():.3f}], "
-          f"Z[{ik_root_pos[:, 2].min():.3f}, {ik_root_pos[:, 2].max():.3f}]")
-    
-    # Calculate root position differences
-    root_pos_diff = np.linalg.norm(ik_root_pos - original_root_pos, axis=1)
-    print(f"Root position differences:")
-    print(f"  Mean: {root_pos_diff.mean():.6f}m")
-    print(f"  Std:  {root_pos_diff.std():.6f}m")
-    print(f"  Max:  {root_pos_diff.max():.6f}m")
-    print(f"  Min:  {root_pos_diff.min():.6f}m")
-    
-    if root_pos_diff.mean() > 0.1:
-        print(f"  ⚠️  WARNING: Large root position differences detected!")
-    else:
-        print(f"  ✅ Root positions are reasonably close")
-    
-    # Compare joint positions for key joints
-    key_joints = ['L_Hip', 'R_Hip', 'L_Knee', 'R_Knee', 'L_Ankle', 'R_Ankle', 'L_Toe', 'R_Toe']
-    joint_indices = [source_motion.skeleton_tree.node_names.index(name) for name in key_joints if name in source_motion.skeleton_tree.node_names]
-    
-    print(f"\n📊 JOINT POSITION COMPARISON:")
-    for i, joint_name in enumerate(key_joints):
-        if joint_name in source_motion.skeleton_tree.node_names:
-            joint_idx = source_motion.skeleton_tree.node_names.index(joint_name)
-            original_joint_pos = original_positions[:, joint_idx, :]
-            ik_joint_pos = debug_positions[:, joint_idx, :]
-            
-            joint_diff = np.linalg.norm(ik_joint_pos - original_joint_pos, axis=1)
-            print(f"{joint_name:>8}: mean_diff={joint_diff.mean():.6f}m, max_diff={joint_diff.max():.6f}m")
-            
-            if joint_diff.mean() > 0.2:
-                print(f"         ⚠️  Large differences for {joint_name}")
-    
-    # Analyze IK joint angles
-    print(f"\n📊 IK JOINT ANGLE ANALYSIS:")
-    joint_angles = poses[:, 6:].numpy()  # Extract joint angles (skip root DOFs)
-    
-    print(f"Joint angle statistics:")
-    print(f"  Range: [{joint_angles.min():.3f}, {joint_angles.max():.3f}] rad")
-    print(f"  Mean:  {joint_angles.mean():.6f} rad")
-    print(f"  Std:   {joint_angles.std():.6f} rad")
-    
-    # Check if joint angles are reasonable (not all zeros or extreme values)
-    if np.allclose(joint_angles, 0, atol=1e-6):
-        print(f"  ⚠️  WARNING: All joint angles are zero! IK may not be working.")
-    elif np.abs(joint_angles).max() > 10.0:  # More than ~573 degrees
-        print(f"  ⚠️  WARNING: Extreme joint angles detected!")
-    else:
-        print(f"  ✅ Joint angles appear reasonable")
-    
-    # Analyze IK root rotation
-    print(f"\n📊 IK ROOT ROTATION ANALYSIS:")
-    root_rot_quat = trans[:, 3:7]  # Extract quaternion part
-    root_rot_norms = np.linalg.norm(root_rot_quat, axis=1)
-    
-    print(f"Root rotation quaternion norms:")
-    print(f"  Range: [{root_rot_norms.min():.6f}, {root_rot_norms.max():.6f}]")
-    print(f"  Mean:  {root_rot_norms.mean():.6f}")
-    
-    # Check if quaternions are normalized (should be close to 1.0)
-    if not np.allclose(root_rot_norms, 1.0, atol=1e-3):
-        print(f"  ⚠️  WARNING: Root rotation quaternions are not normalized!")
-    else:
-        print(f"  ✅ Root rotation quaternions are properly normalized")
-    
-    # Check for motion consistency
-    print(f"\n📊 MOTION CONSISTENCY ANALYSIS:")
-    
-    # Check if IK root is moving
-    ik_root_vel = np.diff(ik_root_pos, axis=0) * source_motion.fps
-    ik_root_vel_mag = np.linalg.norm(ik_root_vel, axis=1)
-    print(f"IK root velocity:")
-    print(f"  Mean: {ik_root_vel_mag.mean():.3f} m/s")
-    print(f"  Max:  {ik_root_vel_mag.max():.3f} m/s")
-    
-    if ik_root_vel_mag.mean() < 0.01:
-        print(f"  ⚠️  WARNING: IK root is barely moving!")
-    else:
-        print(f"  ✅ IK root shows reasonable movement")
-    
-    # Check if joint angles are changing
-    joint_angle_vel = np.diff(joint_angles, axis=0) * source_motion.fps
-    joint_angle_vel_mag = np.linalg.norm(joint_angle_vel, axis=1)
-    print(f"Joint angle velocity:")
-    print(f"  Mean: {joint_angle_vel_mag.mean():.3f} rad/s")
-    print(f"  Max:  {joint_angle_vel_mag.max():.3f} rad/s")
-    
-    if joint_angle_vel_mag.mean() < 0.01:
-        print(f"  ⚠️  WARNING: Joint angles are barely changing!")
-    else:
-        print(f"  ✅ Joint angles show reasonable movement")
-    
-    print("="*60)
-
-    print("✅ Retargeting complete! Output saved successfully.")
 
 
 if __name__ == "__main__":

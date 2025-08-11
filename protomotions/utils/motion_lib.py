@@ -104,6 +104,10 @@ class MotionLib(DeviceDtypeModuleMixin):
         if str(motion_file).split(".")[-1] in ["yaml", "npy", "npz", "np"]:
             print("Loading motions from yaml/npy file")
             print(f"Motion file path: {motion_file}")
+            print(f"fix_motion_heights: {fix_motion_heights}")
+            print(f"ref_height_adjust: {ref_height_adjust}")
+            print(f"self.fix_heights: {self.fix_heights}")
+            print(f"self.ref_height_adjust: {self.ref_height_adjust}")
             self._load_motions(motion_file, target_frame_rate)
         else:
             rank = _get_rank()
@@ -127,6 +131,36 @@ class MotionLib(DeviceDtypeModuleMixin):
         self.motion_file = motion_file
 
         motions = self.state.motions
+        
+        # 🚨 CRITICAL: Debug the loaded motion data before any processing
+        print(f"\n🔍 POST-LOAD MOTION ANALYSIS:")
+        first_motion = motions[0]
+        print(f"First motion global_translation shape: {first_motion.global_translation.shape}")
+        
+        # Check if the motion data itself has the floating feet issue
+        frame_0_positions = first_motion.global_translation[0]  # First frame
+        print(f"Raw motion data - first frame positions:")
+        for i in range(min(9, frame_0_positions.shape[0])):  # Show first 9 bodies
+            pos = frame_0_positions[i]
+            print(f"  Body {i}: [{pos[0]:.4f}, {pos[1]:.4f}, {pos[2]:.4f}]")
+        
+        # Based on your config: L_Ankle=3, R_Ankle=7
+        if frame_0_positions.shape[0] > 7:
+            l_ankle_z = frame_0_positions[3, 2].item() if frame_0_positions.shape[0] > 3 else "N/A"
+            r_ankle_z = frame_0_positions[7, 2].item() if frame_0_positions.shape[0] > 7 else "N/A"
+            pelvis_z = frame_0_positions[0, 2].item()
+            print(f"🦶 ANKLE ANALYSIS (from raw motion):")
+            print(f"   Pelvis (body 0) Z: {pelvis_z:.4f}m")
+            print(f"   L_Ankle (body 3) Z: {l_ankle_z}")
+            print(f"   R_Ankle (body 7) Z: {r_ankle_z}")
+            
+            if isinstance(l_ankle_z, float) and isinstance(r_ankle_z, float):
+                if l_ankle_z > pelvis_z or r_ankle_z > pelvis_z:
+                    print("   🚨 PROBLEM FOUND: Feet are floating in the RAW MOTION DATA!")
+                    print("   💡 This means the issue is in your retargeting process, not MotionLib")
+                else:
+                    print("   ✅ Raw motion data looks normal - issue might be in MotionLib processing")
+        
         self.register_buffer(
             "gts",
             torch.cat([m.global_translation for m in motions], dim=0).to(
@@ -267,29 +301,18 @@ class MotionLib(DeviceDtypeModuleMixin):
     def get_motion_state(
             self, motion_ids, motion_times, joint_3d_format="exp_map"
     ) -> RobotState:
-        # Debug prints to track motion data flow
-        print("\n=== DEBUG: MotionLib.get_motion_state ===")
-        print(f"motion_ids: {motion_ids}")
-        print(f"motion_times: {motion_times}")
-        print(f"joint_3d_format: {joint_3d_format}")
-        
         motion_len = self.state.motion_lengths[motion_ids]
-        print(f"motion_len: {motion_len}")
         
         motion_times = motion_times.clip(min=0).clip(
             max=motion_len
         )  # Making sure time is in bounds
-        print(f"clipped motion_times: {motion_times}")
 
         num_frames = self.state.motion_num_frames[motion_ids]
         dt = self.state.motion_dt[motion_ids]
-        print(f"num_frames: {num_frames}")
-        print(f"dt: {dt}")
 
         frame_idx0, frame_idx1, blend = self._calc_frame_blend(
             motion_times, motion_len, num_frames, dt
         )
-        print(f"frame_idx0: {frame_idx0}, frame_idx1: {frame_idx1}, blend: {blend}")
 
         f0l = frame_idx0 + self.length_starts[motion_ids]
         f1l = frame_idx1 + self.length_starts[motion_ids]
@@ -352,8 +375,6 @@ class MotionLib(DeviceDtypeModuleMixin):
         for v in vals:
             assert v.dtype != torch.float64
 
-        blend = blend.unsqueeze(-1)
-
         root_pos: Tensor = (1.0 - blend) * root_pos0 + blend * root_pos1
         root_pos[:, 2] += self.ref_height_adjust
 
@@ -363,15 +384,11 @@ class MotionLib(DeviceDtypeModuleMixin):
         key_body_pos = (1.0 - blend_exp) * key_body_pos0 + blend_exp * key_body_pos1
         key_body_pos[:, :, 2] += self.ref_height_adjust
         
-        # Debug prints for motion data values
-        print(f"root_pos0 shape: {root_pos0.shape}, values: {root_pos0}")
-        print(f"root_pos1 shape: {root_pos1.shape}, values: {root_pos1}")
-        print(f"root_pos shape: {root_pos.shape}, values: {root_pos}")
-        print(f"root_rot0 shape: {root_rot0.shape}, values: {root_rot0}")
-        print(f"root_rot1 shape: {root_rot1.shape}, values: {root_rot1}")
-        print(f"root_rot shape: {root_rot.shape}, values: {root_rot}")
-        print(f"key_body_pos shape: {key_body_pos.shape}, values: {key_body_pos}")
-
+        # Quick physics check
+        pelvis_z = root_pos[0, 2].item()
+        feet_z = key_body_pos[0, :, 2]
+        print(f"Height check - Pelvis: {pelvis_z:.3f}m, Feet: {feet_z.cpu().numpy()}")
+        
         if hasattr(self, "dof_pos"):  # H1 joints
             dof_pos = (1.0 - blend) * self.dof_pos[f0l] + blend * self.dof_pos[f1l]
         else:
@@ -385,6 +402,7 @@ class MotionLib(DeviceDtypeModuleMixin):
         dof_vel = (1.0 - blend) * dof_vel0 + blend * dof_vel1
         rigid_body_pos = (1.0 - blend_exp) * rigid_body_pos0 + blend_exp * rigid_body_pos1
         rigid_body_pos[:, :, 2] += self.ref_height_adjust
+        
         rigid_body_rot = torch_utils.slerp(rigid_body_rot0, rigid_body_rot1, blend_exp)
         global_vel = (1.0 - blend_exp) * global_vel0 + blend_exp * global_vel1
         global_ang_vel = (
@@ -404,14 +422,6 @@ class MotionLib(DeviceDtypeModuleMixin):
             rigid_body_vel=global_vel,
             rigid_body_ang_vel=global_ang_vel,
         )
-
-        # Debug print final motion state
-        print("Final motion_state:")
-        print(f"  root_pos: {motion_state.root_pos}")
-        print(f"  root_rot: {motion_state.root_rot}")
-        print(f"  dof_pos: {motion_state.dof_pos}")
-        print(f"  dof_vel: {motion_state.dof_vel}")
-        print(f"  key_body_pos: {motion_state.key_body_pos}")
 
         return motion_state
 
@@ -479,6 +489,30 @@ class MotionLib(DeviceDtypeModuleMixin):
             )
 
             curr_motion = self._load_motion_file(curr_file)
+            
+            # DEBUG: Print original motion data
+            print(f"\n=== DEBUG: Original Motion Data (file {f+1}) ===")
+            print(f"Original root_translation[0]: {curr_motion.root_translation[0]}")
+            print(f"Original global_translation[0,0] (Pelvis): {curr_motion.global_translation[0,0]}")
+            print(f"Original min Z height: {curr_motion.global_translation[..., 2].min()}")
+            print(f"fix_heights flag: {self.fix_heights}")
+            
+            # DEBUG: Print ALL body positions for first frame to understand the skeleton
+            print(f"\n🦴 ALL BODY POSITIONS (first frame):")
+            for body_idx in range(curr_motion.global_translation.shape[1]):
+                pos = curr_motion.global_translation[0, body_idx]
+                print(f"  Body {body_idx:2d}: X={pos[0]:.4f}, Y={pos[1]:.4f}, Z={pos[2]:.4f}")
+            
+            # Find and highlight the lowest bodies (potential feet)
+            z_coords = curr_motion.global_translation[0, :, 2]
+            sorted_indices = torch.argsort(z_coords)
+            print(f"\n🦶 LOWEST BODIES (potential ground contact):")
+            for i in range(min(5, len(sorted_indices))):
+                idx = sorted_indices[i]
+                z = z_coords[idx]
+                print(f"  Rank {i+1}: Body {idx:2d} -> Z={z:.4f}")
+            
+            print("=" * 50)
 
             cur_fps = full_motion_fpses[motion_f]
             if cur_fps is None:
@@ -498,7 +532,18 @@ class MotionLib(DeviceDtypeModuleMixin):
             motion_fpses.append(float(sub_motion.fps))
 
             if self.fix_heights:
-                sub_motion = self.fix_motion_heights(sub_motion, self.skeleton_tree)
+                print("\n=== DEBUG: BEFORE fix_motion_heights ===")
+                print(f"Before fix - root_translation[0]: {sub_motion.root_translation[0]}")
+                print(f"Before fix - global_translation[0,0]: {sub_motion.global_translation[0,0]}")
+                print(f"Before fix - min Z: {sub_motion.global_translation[..., 2].min()}")
+                
+                #sub_motion = self.fix_motion_heights(sub_motion, self.skeleton_tree)
+                
+                print("\n=== DEBUG: AFTER fix_motion_heights ===")
+                print(f"After fix - root_translation[0]: {sub_motion.root_translation[0]}")
+                print(f"After fix - global_translation[0,0]: {sub_motion.global_translation[0,0]}")
+                print(f"After fix - min Z: {sub_motion.global_translation[..., 2].min()}")
+                print("=" * 50)
 
             curr_dt = 1.0 / motion_fpses[f]
 

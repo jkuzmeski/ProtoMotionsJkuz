@@ -29,41 +29,50 @@ def check_for_nan_values(data, path="", max_reports=10):
     def check_array(arr, current_path):
         if not isinstance(arr, np.ndarray):
             return
+        
+        # Skip non-numeric arrays
+        if not np.issubdtype(arr.dtype, np.number):
+            return
             
         nan_report['total_elements'] += arr.size
         
-        # Check for NaN values
-        nan_mask = np.isnan(arr)
-        nan_count = np.sum(nan_mask)
-        if nan_count > 0:
-            nan_report['has_nan'] = True
-            nan_report['nan_count'] += nan_count
-            nan_indices = np.where(nan_mask)
-            for i in range(min(len(nan_indices[0]), max_reports)):
-                location = tuple(idx[i] for idx in nan_indices)
-                nan_report['nan_locations'].append(f"{current_path}[{location}]")
+        try:
+            # Check for NaN values
+            nan_mask = np.isnan(arr)
+            nan_count = np.sum(nan_mask)
+            if nan_count > 0:
+                nan_report['has_nan'] = True
+                nan_report['nan_count'] += nan_count
+                nan_indices = np.where(nan_mask)
+                for i in range(min(len(nan_indices[0]), max_reports)):
+                    location = tuple(idx[i] for idx in nan_indices)
+                    nan_report['nan_locations'].append(f"{current_path}[{location}]")
+            
+            # Check for positive infinity
+            inf_mask = np.isinf(arr) & (arr > 0)
+            inf_count = np.sum(inf_mask)
+            if inf_count > 0:
+                nan_report['has_inf'] = True
+                nan_report['inf_count'] += inf_count
+                inf_indices = np.where(inf_mask)
+                for i in range(min(len(inf_indices[0]), max_reports)):
+                    location = tuple(idx[i] for idx in inf_indices)
+                    nan_report['inf_locations'].append(f"{current_path}[{location}]")
+            
+            # Check for negative infinity
+            neg_inf_mask = np.isinf(arr) & (arr < 0)
+            neg_inf_count = np.sum(neg_inf_mask)
+            if neg_inf_count > 0:
+                nan_report['has_neg_inf'] = True
+                nan_report['neg_inf_count'] += neg_inf_count
+                neg_inf_indices = np.where(neg_inf_mask)
+                for i in range(min(len(neg_inf_indices[0]), max_reports)):
+                    location = tuple(idx[i] for idx in neg_inf_indices)
+                    nan_report['neg_inf_locations'].append(f"{current_path}[{location}]")
         
-        # Check for positive infinity
-        inf_mask = np.isinf(arr) & (arr > 0)
-        inf_count = np.sum(inf_mask)
-        if inf_count > 0:
-            nan_report['has_inf'] = True
-            nan_report['inf_count'] += inf_count
-            inf_indices = np.where(inf_mask)
-            for i in range(min(len(inf_indices[0]), max_reports)):
-                location = tuple(idx[i] for idx in inf_indices)
-                nan_report['inf_locations'].append(f"{current_path}[{location}]")
-        
-        # Check for negative infinity
-        neg_inf_mask = np.isinf(arr) & (arr < 0)
-        neg_inf_count = np.sum(neg_inf_mask)
-        if neg_inf_count > 0:
-            nan_report['has_neg_inf'] = True
-            nan_report['neg_inf_count'] += neg_inf_count
-            neg_inf_indices = np.where(neg_inf_mask)
-            for i in range(min(len(neg_inf_indices[0]), max_reports)):
-                location = tuple(idx[i] for idx in neg_inf_indices)
-                nan_report['neg_inf_locations'].append(f"{current_path}[{location}]")
+        except TypeError:
+            # Skip arrays that don't support NaN/inf operations
+            pass
     
     def recursive_check(obj, current_path):
         if isinstance(obj, np.ndarray):
@@ -235,116 +244,6 @@ def debug_motion_processing(motion_data, file_name):
     return None
 
 
-def create_clean_motion_file(motion_data, output_file_path=None):
-    """Create a clean motion file with normalized quaternions and bounded velocities."""
-    if output_file_path is None:
-        output_file_path = "cleaned_motion.npy"
-    
-    print(f"\n=== Creating Clean Motion File ===")
-    print(f"Output file: {output_file_path}")
-    
-    # Create clean motion data
-    clean_data = OrderedDict()
-    
-    # Copy all non-array data
-    for key, value in motion_data.items():
-        if key not in ['rotation', 'root_translation', 'global_velocity', 'global_angular_velocity']:
-            clean_data[key] = value
-    
-    # Clean rotation (normalize quaternions)
-    if 'rotation' in motion_data and 'arr' in motion_data['rotation']:
-        rotation_arr = motion_data['rotation']['arr']
-        if len(rotation_arr.shape) >= 2 and rotation_arr.shape[-1] == 4:
-            norms = np.linalg.norm(rotation_arr, axis=-1)
-            # Avoid division by zero
-            norms = np.clip(norms, 1e-6, None)
-            rotation_arr_normalized = rotation_arr / norms[..., np.newaxis]
-            print("✅ Quaternions normalized")
-        else:
-            rotation_arr_normalized = rotation_arr
-        
-        clean_data['rotation'] = {
-            'arr': rotation_arr_normalized,
-            'context': motion_data['rotation'].get('context', {})
-        }
-    
-    # Clean root translation (bound extreme values)
-    if 'root_translation' in motion_data and 'arr' in motion_data['root_translation']:
-        root_translation_arr = motion_data['root_translation']['arr']
-        root_translation_arr = np.clip(root_translation_arr, -100.0, 100.0)
-        print("✅ Root translation bounded")
-        clean_data['root_translation'] = {
-            'arr': root_translation_arr,
-            'context': motion_data['root_translation'].get('context', {})
-        }
-    
-    # Clean global velocity (bound extreme values)
-    if 'global_velocity' in motion_data and 'arr' in motion_data['global_velocity']:
-        global_velocity_arr = motion_data['global_velocity']['arr']
-        global_velocity_arr = np.clip(global_velocity_arr, -50.0, 50.0)
-        print("✅ Global velocity bounded")
-        clean_data['global_velocity'] = {
-            'arr': global_velocity_arr,
-            'context': motion_data['global_velocity'].get('context', {})
-        }
-    
-    # Clean angular velocity (bound extreme values)
-    if 'global_angular_velocity' in motion_data and 'arr' in motion_data['global_angular_velocity']:
-        angular_velocity_arr = motion_data['global_angular_velocity']['arr']
-        angular_velocity_arr = np.clip(angular_velocity_arr, -100.0, 100.0)
-        print("✅ Angular velocity bounded")
-        clean_data['global_angular_velocity'] = {
-            'arr': angular_velocity_arr,
-            'context': motion_data['global_angular_velocity'].get('context', {})
-        }
-    
-    # Save the clean motion file
-    np.save(output_file_path, clean_data)
-    print(f"✅ Clean motion file saved to: {output_file_path}")
-    
-    return output_file_path
-
-
-def fix_motion_file(motion_data, output_file_path=None):
-    """Fix NaN values in the motion data by replacing them with zeros."""
-    if output_file_path is None:
-        output_file_path = "fixed_motion.npy"
-    
-    print(f"\n=== Fixing Motion File ===")
-    print(f"Output file: {output_file_path}")
-    
-    # Fix NaN values
-    fixed_data = OrderedDict()
-    for key, value in motion_data.items():
-        if isinstance(value, dict):
-            fixed_dict = {}
-            for subkey, subvalue in value.items():
-                if hasattr(subvalue, 'arr'):
-                    # Fix the array
-                    arr = subvalue['arr']
-                    if hasattr(arr, 'shape'):
-                        arr_fixed = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
-                        fixed_dict[subkey] = {'arr': arr_fixed, 'context': subvalue.get('context', {})}
-                    else:
-                        fixed_dict[subkey] = subvalue
-                else:
-                    fixed_dict[subkey] = subvalue
-            fixed_data[key] = fixed_dict
-        elif isinstance(value, (np.ndarray, list)):
-            if isinstance(value, list):
-                arr = np.array(value)
-            else:
-                arr = value
-            arr_fixed = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
-            fixed_data[key] = arr_fixed
-        else:
-            fixed_data[key] = value
-    
-    # Save the fixed motion file
-    np.save(output_file_path, fixed_data)
-    print(f"✅ Fixed motion file saved to: {output_file_path}")
-    
-    return output_file_path
 
 
 def analyze_motion_file(file_path):
@@ -451,119 +350,177 @@ def analyze_motion_file(file_path):
         return None
 
 
-def compare_motion_structures(file1_path, file2_path):
-    """Compare the structures of two motion files."""
-    print(f"\n{'='*80}")
-    print(f"COMPARING MOTION STRUCTURES")
-    print(f"{'='*80}")
-    print(f"File 1: {file1_path}")
-    print(f"File 2: {file2_path}")
+def compare_motion_structures(file1_path, file2_path=None):
+    """Analyze and optionally compare motion file structures.
     
-    # Analyze both files
-    data1 = analyze_motion_file(file1_path)
-    data2 = analyze_motion_file(file2_path)
-    
-    if data1 is None or data2 is None:
-        print("❌ Cannot compare files - one or both failed to load")
-        return
-    
-    print(f"\n{'='*60}")
-    print(f"STRUCTURE COMPARISON")
-    print(f"{'='*60}")
-    
-    # Compare basic properties
-    print(f"Data types:")
-    print(f"  File 1: {type(data1)}")
-    print(f"  File 2: {type(data2)}")
-    
-    if hasattr(data1, 'shape') and hasattr(data2, 'shape'):
-        print(f"Shapes:")
-        print(f"  File 1: {data1.shape}")
-        print(f"  File 2: {data2.shape}")
-    
-    if hasattr(data1, 'dtype') and hasattr(data2, 'dtype'):
-        print(f"Dtypes:")
-        print(f"  File 1: {data1.dtype}")
-        print(f"  File 2: {data2.dtype}")
-    
-    # If both are dictionaries, compare keys
-    if isinstance(data1, dict) and isinstance(data2, dict):
-        keys1 = set(data1.keys())
-        keys2 = set(data2.keys())
+    Args:
+        file1_path (str): Path to the first (or only) motion file
+        file2_path (str, optional): Path to the second motion file for comparison
+    """
+    if file2_path is None:
+        # Single file analysis mode
+        print(f"\n{'='*80}")
+        print(f"ANALYZING MOTION STRUCTURE")
+        print(f"{'='*80}")
+        print(f"File: {file1_path}")
         
-        print(f"\nDictionary keys:")
-        print(f"  File 1 keys ({len(keys1)}): {sorted(keys1)}")
-        print(f"  File 2 keys ({len(keys2)}): {sorted(keys2)}")
+        # Analyze the single file
+        data1 = analyze_motion_file(file1_path)
         
-        common_keys = keys1 & keys2
-        only_in_1 = keys1 - keys2
-        only_in_2 = keys2 - keys1
+        if data1 is None:
+            print("❌ Failed to analyze file")
+            return
         
-        print(f"\nKey comparison:")
-        print(f"  Common keys ({len(common_keys)}): {sorted(common_keys)}")
-        if only_in_1:
-            print(f"  Only in File 1 ({len(only_in_1)}): {sorted(only_in_1)}")
-        if only_in_2:
-            print(f"  Only in File 2 ({len(only_in_2)}): {sorted(only_in_2)}")
+        print(f"\n{'='*60}")
+        print(f"STRUCTURE SUMMARY")
+        print(f"{'='*60}")
+        print(f"Data type: {type(data1)}")
         
-        # Compare common keys in detail
-        if common_keys:
-            print(f"\nDetailed comparison of common keys:")
-            for key in sorted(common_keys):
-                val1 = data1[key]
-                val2 = data2[key]
-                
+        if hasattr(data1, 'shape'):
+            print(f"Shape: {data1.shape}")
+        if hasattr(data1, 'dtype'):
+            print(f"Dtype: {data1.dtype}")
+        
+        if isinstance(data1, dict):
+            keys = set(data1.keys())
+            print(f"Dictionary keys ({len(keys)}): {sorted(keys)}")
+            
+            # Show detailed info for each key
+            print(f"\nDetailed key information:")
+            for key in sorted(keys):
+                val = data1[key]
                 print(f"\n  Key: {key}")
-                print(f"    File 1 type: {type(val1)}")
-                print(f"    File 2 type: {type(val2)}")
+                print(f"    Type: {type(val)}")
                 
-                if isinstance(val1, dict) and isinstance(val2, dict):
-                    subkeys1 = set(val1.keys())
-                    subkeys2 = set(val2.keys())
-                    print(f"    File 1 subkeys: {sorted(subkeys1)}")
-                    print(f"    File 2 subkeys: {sorted(subkeys2)}")
+                if isinstance(val, dict):
+                    subkeys = set(val.keys())
+                    print(f"    Subkeys ({len(subkeys)}): {sorted(subkeys)}")
+                elif hasattr(val, 'shape'):
+                    print(f"    Shape: {val.shape}")
+                    if hasattr(val, 'dtype'):
+                        print(f"    Dtype: {val.dtype}")
+        
+        return data1
+    
+    else:
+        # Two file comparison mode
+        print(f"\n{'='*80}")
+        print(f"COMPARING MOTION STRUCTURES")
+        print(f"{'='*80}")
+        print(f"File 1: {file1_path}")
+        print(f"File 2: {file2_path}")
+        
+        # Analyze both files
+        data1 = analyze_motion_file(file1_path)
+        data2 = analyze_motion_file(file2_path)
+        
+        if data1 is None or data2 is None:
+            print("❌ Cannot compare files - one or both failed to load")
+            return
+        
+        print(f"\n{'='*60}")
+        print(f"STRUCTURE COMPARISON")
+        print(f"{'='*60}")
+        
+        # Compare basic properties
+        print(f"Data types:")
+        print(f"  File 1: {type(data1)}")
+        print(f"  File 2: {type(data2)}")
+        
+        if hasattr(data1, 'shape') and hasattr(data2, 'shape'):
+            print(f"Shapes:")
+            print(f"  File 1: {data1.shape}")
+            print(f"  File 2: {data2.shape}")
+        
+        if hasattr(data1, 'dtype') and hasattr(data2, 'dtype'):
+            print(f"Dtypes:")
+            print(f"  File 1: {data1.dtype}")
+            print(f"  File 2: {data2.dtype}")
+        
+        # If both are dictionaries, compare keys
+        if isinstance(data1, dict) and isinstance(data2, dict):
+            keys1 = set(data1.keys())
+            keys2 = set(data2.keys())
+            
+            print(f"\nDictionary keys:")
+            print(f"  File 1 keys ({len(keys1)}): {sorted(keys1)}")
+            print(f"  File 2 keys ({len(keys2)}): {sorted(keys2)}")
+            
+            common_keys = keys1 & keys2
+            only_in_1 = keys1 - keys2
+            only_in_2 = keys2 - keys1
+            
+            print(f"\nKey comparison:")
+            print(f"  Common keys ({len(common_keys)}): {sorted(common_keys)}")
+            if only_in_1:
+                print(f"  Only in File 1 ({len(only_in_1)}): {sorted(only_in_1)}")
+            if only_in_2:
+                print(f"  Only in File 2 ({len(only_in_2)}): {sorted(only_in_2)}")
+            
+            # Compare common keys in detail
+            if common_keys:
+                print(f"\nDetailed comparison of common keys:")
+                for key in sorted(common_keys):
+                    val1 = data1[key]
+                    val2 = data2[key]
                     
-                    if subkeys1 != subkeys2:
-                        print(f"    ⚠️  Subkey mismatch!")
-                        common_subkeys = subkeys1 & subkeys2
-                        if common_subkeys:
-                            print(f"    Common subkeys: {sorted(common_subkeys)}")
-                
-                elif hasattr(val1, 'shape') and hasattr(val2, 'shape'):
-                    print(f"    File 1 shape: {val1.shape}")
-                    print(f"    File 2 shape: {val2.shape}")
+                    print(f"\n  Key: {key}")
+                    print(f"    File 1 type: {type(val1)}")
+                    print(f"    File 2 type: {type(val2)}")
                     
-                    if val1.shape != val2.shape:
-                        print(f"    ⚠️  Shape mismatch!")
-                    else:
-                        # Compare values if shapes match
-                        if hasattr(val1, 'dtype') and hasattr(val2, 'dtype'):
-                            if val1.dtype == val2.dtype:
-                                diff = np.abs(val1 - val2)
-                                max_diff = np.max(diff)
-                                mean_diff = np.mean(diff)
-                                print(f"    Max difference: {max_diff:.6f}")
-                                print(f"    Mean difference: {mean_diff:.6f}")
-                            else:
-                                print(f"    ⚠️  Dtype mismatch: {val1.dtype} vs {val2.dtype}")
+                    if isinstance(val1, dict) and isinstance(val2, dict):
+                        subkeys1 = set(val1.keys())
+                        subkeys2 = set(val2.keys())
+                        print(f"    File 1 subkeys: {sorted(subkeys1)}")
+                        print(f"    File 2 subkeys: {sorted(subkeys2)}")
+                        
+                        if subkeys1 != subkeys2:
+                            print(f"    ⚠️  Subkey mismatch!")
+                            common_subkeys = subkeys1 & subkeys2
+                            if common_subkeys:
+                                print(f"    Common subkeys: {sorted(common_subkeys)}")
+                    
+                    elif hasattr(val1, 'shape') and hasattr(val2, 'shape'):
+                        print(f"    File 1 shape: {val1.shape}")
+                        print(f"    File 2 shape: {val2.shape}")
+                        
+                        if val1.shape != val2.shape:
+                            print(f"    ⚠️  Shape mismatch!")
+                        else:
+                            # Compare values if shapes match
+                            if hasattr(val1, 'dtype') and hasattr(val2, 'dtype'):
+                                if val1.dtype == val2.dtype:
+                                    diff = np.abs(val1 - val2)
+                                    max_diff = np.max(diff)
+                                    mean_diff = np.mean(diff)
+                                    print(f"    Max difference: {max_diff:.6f}")
+                                    print(f"    Mean difference: {mean_diff:.6f}")
+                                else:
+                                    print(f"    ⚠️  Dtype mismatch: {val1.dtype} vs {val2.dtype}")
+        
+        return data1, data2
 
 
 def main():
     """Main function to analyze and compare motion files."""
 
-    file1_path = 'D:\\Isaac\\IsaacLab2.1.2\\ProtoMotions\\data\\motions\\retargeted_motion.npy'
-    file2_path = 'D:\\Isaac\\IsaacLab2.1.2\\ProtoMotions\\data\\motions\\smpl_humanoid_walk.npy'
+    file1_path = 'D:\\Isaac\\IsaacLab2.1.2\\ProtoMotions\\data\\motions\\smpl_humanoid_walk.npy'
+    file2_path = 'D:\\Isaac\\IsaacLab2.1.2\\ProtoMotions\\data\\motions\\retargeted_motion.npy'
 
-    # Analyze first file
-    data1 = analyze_motion_file(file1_path)
-    
-    if data1 is None:
-        print("❌ Failed to analyze first file")
-        return
-    
-    # Compare with second file if provided
-    if file2_path:
-        compare_motion_structures(file1_path, file2_path)
+    # Use the updated function - it handles both single file analysis and comparison
+    if file2_path is not None:
+        # Two-file comparison mode
+        result = compare_motion_structures(file1_path, file2_path)
+        if result:
+            data1, data2 = result
+            print("✅ Comparison completed successfully")
+    else:
+        # Single file analysis mode
+        result = compare_motion_structures(file1_path)
+        if result is not None:
+            print("✅ Single file analysis completed successfully")
+        else:
+            print("❌ Failed to analyze file")
 
 
 if __name__ == "__main__":

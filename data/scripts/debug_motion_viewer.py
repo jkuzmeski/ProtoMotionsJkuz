@@ -7,7 +7,6 @@ import matplotlib
 import matplotlib.animation
 import matplotlib.pyplot as plt
 import numpy as np
-import torch
 
 import mpl_toolkits.mplot3d  # noqa: F401
 
@@ -53,6 +52,16 @@ class DebugMotionViewer:
         # draw skeleton state
         self._figure_axes.clear()
         self._figure_axes.scatter(*vertices.T, color="black", depthshade=False)
+
+        # add labels for each body part
+        for i, (position, name) in enumerate(zip(vertices, self._body_names)):
+            # offset the text slightly to avoid overlapping with the point
+            self._figure_axes.text(
+                position[0] + 0.05, position[1] + 0.05, position[2] + 0.05, 
+                name, 
+                fontsize=8, 
+                alpha=0.8
+            )
         # adjust exes according to motion view
         # - scene
         if self._render_scene:

@@ -342,7 +342,7 @@ def create_robot_motion(
             humanoid_batch.dof_axis * poses_tensor,
             torch.zeros((1, seq_len, len(cfg.extend_config), 3)),
         ],
-        axis=2,
+        dim=2,
     )
 
     # Prepare root translation
@@ -384,37 +384,78 @@ def create_skeleton_motion(
 ) -> SkeletonMotion:
     """Create a SkeletonMotion from poses and translations.
     Args:
-        poses: Joint angles from mujoco [N, 153] - groups of 3 hinge joints per joint
+        poses: Joint angles from mujoco [N, num_dof] - groups of 3 hinge joints per joint
         trans: Root transform [N, 7] (pos + quat)
         skeleton_tree: Skeleton tree for the model
         orig_global_trans: Original global translations [N, num_joints, 3]
         mocap_fr: Motion capture framerate
     """
     n_frames = poses.shape[0]
-    pose_quat = np.zeros((n_frames, 51, 4))  # 51 joints, each with quaternion
+    num_joints = len(skeleton_tree.node_names)
+    
+    print(f"Debug: poses shape: {poses.shape}, skeleton joints: {num_joints}")
+    print(f"Debug: skeleton joints: {skeleton_tree.node_names}")
+    
+    # The Pelvis is handled as root transform (trans), other joints get pose data
+    # For smpl_humanoid_lower_body: Pelvis + 8 actuated joints = 9 total joints
+    # But poses only contains 8 joints * 3 DOF = 24 DOF (excluding Pelvis)
+    actuated_joints = [name for name in skeleton_tree.node_names if name != "Pelvis"]
+    expected_dof = len(actuated_joints) * 3
+    actual_dof = poses.shape[1] if len(poses.shape) > 1 else 0
+    
+    print(f"Debug: Actuated joints: {actuated_joints}")
+    print(f"Debug: Expected DOF: {expected_dof}, Actual DOF: {actual_dof}")
+    
+    # Initialize quaternions for all joints
+    pose_quat = np.zeros((n_frames, num_joints, 4))
+    
+    # Handle Pelvis (root joint) - use rotation from trans
+    pelvis_idx = skeleton_tree.node_names.index("Pelvis")
+    pose_quat[:, pelvis_idx] = np.roll(trans[:, 3:7], -1, axis=1)  # Convert XYZW to WXYZ
+    
+    # Handle actuated joints
+    if actual_dof == 0:
+        print(f"Warning: poses array is empty, using identity quaternions for actuated joints")
+        # Fill actuated joints with identity quaternions
+        for i, joint_name in enumerate(skeleton_tree.node_names):
+            if joint_name != "Pelvis":
+                pose_quat[:, i, 0] = 1.0  # w component = 1 for identity quaternion
+                pose_quat[:, i, 1:] = 0.0  # x, y, z components = 0
+    else:
+        # Process actuated joints with pose data
+        actuated_joint_idx = 0
+        for i, joint_name in enumerate(skeleton_tree.node_names):
+            if joint_name == "Pelvis":
+                continue  # Already handled above
+                
+            start_idx = actuated_joint_idx * 3
+            end_idx = (actuated_joint_idx + 1) * 3
+            
+            if end_idx <= actual_dof:
+                angles = poses[:, start_idx:end_idx]
+                if angles.shape[1] == 3:  # Make sure we have 3 angles per joint
+                    pose_quat[:, i] = sRot.from_euler("XYZ", angles).as_quat()
+                    print(f"Debug: Processed {joint_name} with pose data")
+                else:
+                    print(f"Warning: Joint {joint_name} has {angles.shape[1]} angles instead of 3, using identity")
+                    pose_quat[:, i, 0] = 1.0  # Identity quaternion
+                    pose_quat[:, i, 1:] = 0.0
+            else:
+                print(f"Warning: Joint {joint_name} index {end_idx} exceeds poses DOF {actual_dof}, using identity")
+                pose_quat[:, i, 0] = 1.0  # Identity quaternion
+                pose_quat[:, i, 1:] = 0.0
+                
+            actuated_joint_idx += 1
 
-    # Convert each joint's 3 hinge rotations to a single quaternion
-    for i in range(51):  # 51 joints
-        angles = poses[
-            :, i * 3 : (i + 1) * 3
-        ]  # Get angles for this joint's x,y,z hinges
-        pose_quat[:, i] = sRot.from_euler("XYZ", angles).as_quat()
-
-    # Combine root transform and joint rotations
-    full_pose = np.zeros((n_frames, 52, 4))  # 52 total joints (root + 51 joints)
-    full_pose[:, 0] = np.roll(trans[:, 3:7], -1)  # Root quaternion
-    full_pose[:, 1:] = pose_quat  # Other joint quaternions
-
-    # Create skeleton state
+    # Create skeleton state - use global rotations for better compatibility
     sk_state = SkeletonState.from_rotation_and_root_translation(
         skeleton_tree,
-        torch.from_numpy(full_pose),
+        torch.from_numpy(pose_quat),
         torch.from_numpy(trans[:, :3]),
-        is_local=True,
+        is_local=False,  # Use global rotations
     )
 
-    # Get global rotations and positions
-    pose_quat_global = sk_state.global_rotation.numpy()
+    # Get global positions for height adjustment
     global_pos = sk_state.global_translation.numpy()
 
     # Get lowest heights for both original and retargeted motions
@@ -431,7 +472,7 @@ def create_skeleton_motion(
     # Create new skeleton state with adjusted heights
     new_sk_state = SkeletonState.from_rotation_and_root_translation(
         skeleton_tree,
-        torch.from_numpy(pose_quat_global),
+        torch.from_numpy(pose_quat),
         torch.from_numpy(adjusted_trans[:, :3]),
         is_local=False,
     )
@@ -614,80 +655,125 @@ def retarget_motion(motion: SkeletonMotion, robot_type: str, render: bool = Fals
     return retargeted_motion
 
 
-def create_motion_from_txt(filepath: str, treadmill_speed: float, mocap_fr: int = 200):  # Assuming 100Hz from C3D
-    """
-    Loads joint center data from your specific .txt file format
-    and creates a SkeletonMotion object.
-    """
-    # 1. Load your raw data, skipping the text header
-    print(f"Loading data from {filepath}...")
-    # Use skiprows=5 to ignore the header lines in your specific file
-    raw_data = np.loadtxt(filepath, skiprows=5)
-    
-    # The first column is the frame number, so we skip it with [:, 1:]
-    num_frames = raw_data.shape[0]
-    num_joints = (raw_data.shape[1] - 1) // 3
-    print(f"Loaded {num_frames} frames for {num_joints} joints.")
-    
-    # Reshape the data to (num_frames, num_joints, 3)
-    joint_centers = raw_data[:, 1:].reshape((num_frames, num_joints, 3))
 
-    # The data seems to be in millimeters, convert to meters
-    joint_centers /= 1000.0
+def manually_retarget_motion(
+    amass_data: str, output_path: str, robot_type: str, render: bool = False
+):
+    # Store retargeted motion data
+    motion_data = dict(np.load(open(amass_data, "rb"), allow_pickle=True))
 
-    # 2. Add treadmill velocity to the root (pelvis)
-    # Your data file is S02_3-0ms, which suggests 3.0 m/s
-    time_steps = np.arange(num_frames) / mocap_fr
-    joint_centers[:, 0, 0] += treadmill_speed * time_steps  # Assuming treadmill on X-axis
+    mujoco_joint_names = SMPLH_MUJOCO_NAMES
+    joint_names = SMPLH_BONE_ORDER_NAMES
 
-    # 3. Create a basic SkeletonTree for the IK target
-    joint_names = ["Pelvis", "L_Hip", "L_Knee", "L_Ankle", "L_Toe", "R_Hip", "R_Knee", "R_Ankle", "R_Toe"]
-    parents = [-1, 0, 1, 2, 3, 0, 5, 6, 7] # Simple chain hierarchy
-    skeleton_tree = SkeletonTree(parents, joint_names)
+    betas = motion_data["betas"]
+    gender = motion_data["gender"]
+    amass_pose = motion_data["poses"]
+    amass_trans = motion_data["trans"]
+    if "mocap_framerate" in motion_data:
+        mocap_fr = motion_data["mocap_framerate"]
+    else:
+        mocap_fr = motion_data["mocap_frame_rate"]
 
-    # 4. Create a SkeletonState with placeholder rotations
-    # The IK solver only needs the target *positions*, so we can use identity rotations.
-    identity_rotations = np.zeros((num_frames, num_joints, 4))
-    identity_rotations[..., 3] = 1.0  # w=1 for identity quaternion
+    skip = int(mocap_fr // 30)
+
+    pose_aa = torch.tensor(amass_pose[::skip])
+    amass_trans = torch.tensor(amass_trans[::skip])
+    betas = torch.from_numpy(betas)
+
+    betas[:] = 0
+
+    motion_data = {
+        "pose_aa": pose_aa.numpy(),
+        "trans": amass_trans.numpy(),
+        "beta": betas.numpy(),
+    }
+
+    smpl_2_mujoco = [
+        joint_names.index(q) for q in mujoco_joint_names if q in joint_names
+    ]
+    batch_size = motion_data["pose_aa"].shape[0]
+
+    pose_aa = np.concatenate(
+        [
+            motion_data["pose_aa"][:, :66],
+            motion_data["pose_aa"][:, 75:],
+        ],
+        axis=-1,
+    )
+    pose_aa_mj = pose_aa.reshape(batch_size, 52, 3)[:, smpl_2_mujoco]
+    pose_quat = (
+        sRot.from_rotvec(pose_aa_mj.reshape(-1, 3)).as_quat().reshape(batch_size, 52, 4)
+    )
+
+    robot_cfg = {
+        "mesh": False,
+        "rel_joint_lm": True,
+        "upright_start": True,
+        "remove_toe": False,
+        "real_weight": True,
+        "real_weight_porpotion_capsules": True,
+        "real_weight_porpotion_boxes": True,
+        "replace_feet": True,
+        "masterfoot": False,
+        "big_ankle": True,
+        "freeze_hand": False,
+        "box_body": False,
+        "master_range": 50,
+        "body_params": {},
+        "joint_params": {},
+        "geom_params": {},
+        "actuator_params": {},
+        "model": "smplx",
+        "sim": "isaacgym",
+    }
+
+    smpl_local_robot = SMPL_Robot(
+        robot_cfg,
+        data_dir="data/smpl",
+    )
+
+    smpl_local_robot.load_from_skeleton(betas=betas[None,], gender=[0], objs_info=None)
+    TMP_SMPL_DIR = "/tmp/smpl"
+    uuid_str = uuid.uuid4()
+    smpl_local_robot.write_xml(f"{TMP_SMPL_DIR}/smpl_humanoid_{uuid_str}.xml")
+    skeleton_tree = SkeletonTree.from_mjcf(
+        f"{TMP_SMPL_DIR}/smpl_humanoid_{uuid_str}.xml"
+    )
+
+    root_trans_offset = (
+        torch.from_numpy(motion_data["trans"]) + skeleton_tree.local_translation[0]
+    )
 
     sk_state = SkeletonState.from_rotation_and_root_translation(
-        skeleton_tree,
-        torch.from_numpy(identity_rotations).float(),
-        torch.from_numpy(joint_centers[:, 0, :]).float(),  # Root is the pelvis
+        skeleton_tree,  # This is the wrong skeleton tree (location wise) here, but it's fine since we only use the parent relationship here.
+        torch.from_numpy(pose_quat),
+        root_trans_offset,
         is_local=True,
     )
-    
-    # IMPORTANT: Override the global translation with your precise joint center data
-    sk_state.global_translation = torch.from_numpy(joint_centers).float()
-    
-    print("SkeletonMotion object created successfully.")
-    return SkeletonMotion.from_skeleton_state(sk_state, fps=mocap_fr)
 
+    timeseries_length = pose_aa.shape[0]
+    pose_quat_global = (
+        (
+            sRot.from_quat(sk_state.global_rotation.reshape(-1, 4).numpy())
+            * sRot.from_quat([0.5, 0.5, 0.5, 0.5]).inv()
+        )
+        .as_quat()
+        .reshape(timeseries_length, -1, 4)
+    )
 
-# --- MODIFY THE MAIN RETARGETING FUNCTION ---
-def manually_retarget_motion(
-    # Change the input from amass_data to your file path
-    your_data_path: str, 
-    output_path: str, 
-    robot_type: str, 
-    # Add treadmill speed as a parameter
-    treadmill_speed: float = 1.5,
-    render: bool = False
-):
-    # 1. CREATE THE MOTION OBJECT FROM YOUR TXT FILE
-    # This replaces all the AMASS loading and processing logic
-    print("Loading motion from your .txt file...")
-    new_sk_motion = create_motion_from_txt(your_data_path, treadmill_speed)
-    
-    # 2. RUN THE RETARGETING
-    # The rest of the pipeline remains the same!
-    print("Starting retargeting process...")
+    trans = root_trans_offset.clone()
+    new_sk_state = SkeletonState.from_rotation_and_root_translation(
+        skeleton_tree,
+        torch.from_numpy(pose_quat_global),
+        trans,
+        is_local=False,
+    )
+    new_sk_motion = SkeletonMotion.from_skeleton_state(new_sk_state, fps=30)
     sk_motion = retarget_motion(new_sk_motion, robot_type, render=render)
-
-    # 3. SAVE THE OUTPUT
-    # For a custom robot, it's safest to save as a generic .npy file
-    print(f"Saving retargeted motion to {output_path}")
-    sk_motion.to_file(output_path)
+    if robot_type in ["h1", "g1"]:
+        torch.save(sk_motion, output_path)
+    else:
+        sk_motion.to_file(output_path)
 
 
 if __name__ == "__main__":

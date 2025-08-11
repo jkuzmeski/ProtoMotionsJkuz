@@ -336,7 +336,7 @@ def get_config(humanoid_type: str):
         return smplx_with_limits_mapping()
     elif humanoid_type == "g1":
         return g1_mapping()
-    elif humanoid_type == "smpl_lower_body":
+    elif humanoid_type == "smpl_humanoid_lower_body":
         return smpl_lower_body_mapping()
     else:
         raise NotImplementedError
