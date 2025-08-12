@@ -96,18 +96,12 @@ class MotionLib(DeviceDtypeModuleMixin):
 
         self.register_buffer(
             "key_body_ids",
-            key_body_ids.detach().clone() if hasattr(key_body_ids, 'detach') 
-            else torch.tensor(key_body_ids, dtype=torch.long, device=device),
+            torch.tensor(key_body_ids, dtype=torch.long, device=device),
             persistent=False,
         )
 
         if str(motion_file).split(".")[-1] in ["yaml", "npy", "npz", "np"]:
             print("Loading motions from yaml/npy file")
-            print(f"Motion file path: {motion_file}")
-            print(f"fix_motion_heights: {fix_motion_heights}")
-            print(f"ref_height_adjust: {ref_height_adjust}")
-            print(f"self.fix_heights: {self.fix_heights}")
-            print(f"self.ref_height_adjust: {self.ref_height_adjust}")
             self._load_motions(motion_file, target_frame_rate)
         else:
             rank = _get_rank()
@@ -131,7 +125,6 @@ class MotionLib(DeviceDtypeModuleMixin):
         self.motion_file = motion_file
 
         motions = self.state.motions
-
         self.register_buffer(
             "gts",
             torch.cat([m.global_translation for m in motions], dim=0).to(
@@ -273,7 +266,6 @@ class MotionLib(DeviceDtypeModuleMixin):
             self, motion_ids, motion_times, joint_3d_format="exp_map"
     ) -> RobotState:
         motion_len = self.state.motion_lengths[motion_ids]
-        
         motion_times = motion_times.clip(min=0).clip(
             max=motion_len
         )  # Making sure time is in bounds
@@ -346,6 +338,8 @@ class MotionLib(DeviceDtypeModuleMixin):
         for v in vals:
             assert v.dtype != torch.float64
 
+        blend = blend.unsqueeze(-1)
+
         root_pos: Tensor = (1.0 - blend) * root_pos0 + blend * root_pos1
         root_pos[:, 2] += self.ref_height_adjust
 
@@ -368,7 +362,6 @@ class MotionLib(DeviceDtypeModuleMixin):
         dof_vel = (1.0 - blend) * dof_vel0 + blend * dof_vel1
         rigid_body_pos = (1.0 - blend_exp) * rigid_body_pos0 + blend_exp * rigid_body_pos1
         rigid_body_pos[:, :, 2] += self.ref_height_adjust
-        
         rigid_body_rot = torch_utils.slerp(rigid_body_rot0, rigid_body_rot1, blend_exp)
         global_vel = (1.0 - blend_exp) * global_vel0 + blend_exp * global_vel1
         global_ang_vel = (
@@ -404,7 +397,9 @@ class MotionLib(DeviceDtypeModuleMixin):
         else:
             end_frame = int(end * motion.fps)
 
-        assert (start_frame < end_frame), f"Motion start frame {start_frame} >= motion end frame {end_frame}"
+        assert (
+                start_frame < end_frame
+        ), f"Motion start frame {start_frame} >= motion end frame {end_frame}"
 
         sliced_local_rotation = motion.local_rotation[start_frame:end_frame].clone()
         sliced_root_translation = motion.root_translation[start_frame:end_frame].clone()
@@ -459,7 +454,7 @@ class MotionLib(DeviceDtypeModuleMixin):
             cur_fps = full_motion_fpses[motion_f]
             if cur_fps is None:
                 cur_fps = curr_motion.fps
-
+                
             if cur_fps > target_frame_rate:
                 # Not necessary, but we downsample the FPS to save memory
                 # do nothing if cur_fps <= target_frame_rate
@@ -473,7 +468,7 @@ class MotionLib(DeviceDtypeModuleMixin):
             sub_motion = self._slice_motion_file(curr_motion, motion_timings[f])
             motion_fpses.append(float(sub_motion.fps))
 
-            if self.fix_heights:                
+            if self.fix_heights:
                 sub_motion = self.fix_motion_heights(sub_motion, self.skeleton_tree)
 
             curr_dt = 1.0 / motion_fpses[f]
@@ -713,7 +708,9 @@ class MotionLib(DeviceDtypeModuleMixin):
                 elif configured_joint_axis == "z":
                     joint_axis[..., 2]
 
-                joint_theta = (joint_theta * joint_axis)
+                joint_theta = (
+                        joint_theta * joint_axis
+                )
 
                 joint_theta = rotations.normalize_angle(joint_theta)
                 dof_pos[:, joint_offset] = joint_theta
