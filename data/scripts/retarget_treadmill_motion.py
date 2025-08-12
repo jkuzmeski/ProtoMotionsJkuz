@@ -19,8 +19,6 @@ import matplotlib.animation
 import mpl_toolkits.mplot3d  # noqa: F401
 
 from poselib.skeleton.skeleton3d import SkeletonTree, SkeletonMotion, SkeletonState
-from poselib.core.rotation3d import quat_inverse, quat_mul_norm, quat_from_angle_axis
-
 
 import mink
 import mujoco
@@ -108,7 +106,6 @@ def construct_model(robot_name: str, keypoint_names: Sequence[str]):
 
 # ---- Core Retargeting Logic ----
 
-
 def retarget_motion_with_mink(
     joint_positions: np.ndarray,
     joint_names: list,
@@ -117,23 +114,25 @@ def retarget_motion_with_mink(
     render: bool = False
 ) -> SkeletonMotion:
     """
-    Retargets motion using mink IK solver and returns a SkeletonMotion object.
+    Retargets motion using mink IK solver.
     """
-    # ... (all your setup code remains the same until the main loop) ...
     robot_type = "smpl_humanoid_lower_body"
     n_frames = joint_positions.shape[0]
     model_joint_names = skeleton_tree.node_names
     n_model_joints = len(model_joint_names)
 
+    # Prepare global translations for all model joints from the input positions
     global_translations = np.zeros((n_frames, n_model_joints, 3))
     for i, name in enumerate(joint_names):
         if name in model_joint_names:
             model_idx = model_joint_names.index(name)
             global_translations[:, model_idx, :] = joint_positions[:, i, :]
 
+    # Use identity quaternions for orientation targets as we only have position data
     pose_quat_global = np.zeros((n_frames, n_model_joints, 4))
-    pose_quat_global[..., 0] = 1.0
+    pose_quat_global[..., 0] = 1.0  # WXYZ format
 
+    # --- Mink IK setup ---
     model = construct_model(robot_type, model_joint_names)
     configuration = mink.Configuration(model)
     tasks = []
@@ -144,18 +143,23 @@ def retarget_motion_with_mink(
             frame_name=retarget_info["name"],
             frame_type="body",
             position_cost=10.0 * retarget_info["weight"],
-            orientation_cost=0.1,
+            orientation_cost=0.0,  # No orientation data
             lm_damping=1.0,
         )
         tasks.append(task)
 
-    posture_task = mink.PostureTask(model, cost=1e-6)
+    posture_task = mink.PostureTask(model, cost=1.0)
     tasks.append(posture_task)
+
     data = configuration.data
+
+    # --- Viewer setup (optional) ---
     viewer_context = mujoco.viewer.launch_passive(model=model, data=data, show_left_ui=False, show_right_ui=True) if render else nullcontext()
 
     all_root_translations = []
-    all_global_rotations = []
+    all_root_rotations = []
+    all_joint_angles = []
+    all_joint_positions = []
 
     with viewer_context as viewer:
         if render and viewer:
@@ -163,104 +167,196 @@ def retarget_motion_with_mink(
             viewer.cam.lookat[:] = [0, 0, 1]
             viewer.cam.distance = 3.0
 
-        data.qpos[0:3] = global_translations[0, 0]
-        data.qpos[3:7] = pose_quat_global[0, 0]
+        # Initialize pose
+        data.qpos[0:3] = global_translations[0, 0]  # Initial root position
+        data.qpos[3:7] = pose_quat_global[0, 0]  # Initial root orientation (identity)
         configuration.update(data.qpos)
         mujoco.mj_forward(model, data)
-        # We still set the initial target here
         posture_task.set_target_from_configuration(configuration)
 
         solver = "quadprog"
         rate = RateLimiter(frequency=float(fps))
         pbar = tqdm(total=n_frames, desc="Retargeting frames")
-        posture_task.set_target_from_configuration(configuration)
-        
+
         for t in range(n_frames):
+            # Set IK targets for the current frame
             for i, (joint_name, retarget_info) in enumerate(keypoint_map.items()):
                 model_idx = model_joint_names.index(joint_name)
                 target_pos = global_translations[t, model_idx, :].copy()
                 target_rot = pose_quat_global[t, model_idx].copy()
-                rot_matrix = sRot.from_quat(np.roll(target_rot, -1)).as_matrix()
+
+                rot_matrix = sRot.from_quat(np.roll(target_rot, -1)).as_matrix()  # WXYZ -> XYZW
                 rot = mink.SO3.from_matrix(rot_matrix)
-                
                 tasks[i].set_target(mink.SE3.from_rotation_and_translation(rot, target_pos))
 
+            # Solve IK
             vel = mink.solve_ik(configuration, tasks, rate.dt, solver)
             configuration.integrate_inplace(vel, rate.dt)
 
             all_root_translations.append(configuration.data.qpos[:3].copy())
-            all_global_rotations.append(configuration.data.xquat.copy())
-            print(f"[DEBUG] Frame {t}: Root Translation: {all_root_translations[-1]}, Global Rotation: {all_global_rotations[-1]}")
+            all_root_rotations.append(configuration.data.qpos[3:7].copy())
+            all_joint_angles.append(configuration.data.qpos[7:].copy())
+            all_joint_positions.append(configuration.data.xpos[10:].copy())
+
+            # print(f"[DEBUG] Frame {t}: Root Translation: {all_root_translations[-1]}, Global Rotation: {all_root_rotations[-1]}")
+            # print(f"[DEBUG] Frame {t}: Joint Angles shape: {all_joint_angles[-1].shape}")
+            # print(f"[DEBUG] Frame {t}: Joint Angles: {all_joint_angles[-1]}")
+            # print(f"[DEBUG] Frame {t}: Joint Positions shape: {all_joint_positions[-1].shape}")
+            # print(f"[DEBUG] Frame {t}: Joint Positions: {all_joint_positions[-1]}")
 
             pbar.update(1)
             if render and viewer:
                 viewer.sync()
                 rate.sleep()
+
         pbar.close()
 
-    # ... (the rest of your function for creating the SkeletonMotion object is correct) ...
-    root_translations_tensor = torch.from_numpy(np.stack(all_root_translations)).float()
-    global_rotations_tensor_wxyz = torch.from_numpy(np.stack(all_global_rotations)).float()
+    root_translations = np.array(all_root_translations)
+
+    root_rotations_wxyz = all_root_rotations
+    root_rotations_xyzw = np.roll(root_rotations_wxyz, shift=-1, axis=-1)
+
+    rotations_xyz = all_joint_angles
+    rotations_xyzw = euler_to_quaternion(rotations_xyz)
+    # reshape the rotations_xyzw to (n_frames, n_joints, 4)
+    rotations_xyzw = np.array(rotations_xyzw).reshape(n_frames, (len(model_joint_names)-1), 4)
+
+    rotations_quat = np.zeros((n_frames, len(model_joint_names) * 4))
+
+
+    for i in range(n_frames):
+        # Concatenate root rotation and joint rotations into a single array
+        rotations_quat[i] = np.concatenate((root_rotations_xyzw[i], rotations_xyzw[i].flatten()))
+        # print(f"[DEBUG] Frame {i}: Rotations (Euler): {rotations_euler}")
     
-    global_rotations_tensor = torch.roll(global_rotations_tensor_wxyz, shifts=-1, dims=-1)
+    # reshape into (n_frames, n_joints, 4)
+    rotations_quat = np.array(rotations_quat).reshape(n_frames, (len(model_joint_names)), 4)
 
-    parent_indices = skeleton_tree.parent_indices
-    local_rotations_list = []
 
-    for i in range(n_model_joints):
-        parent_idx = parent_indices[i]
-        if parent_idx == -1:
-            local_rotations_list.append(global_rotations_tensor[:, i + 1, :])
-        else:
-            parent_global_rot = global_rotations_tensor[:, parent_idx + 1, :]
-            child_global_rot = global_rotations_tensor[:, i + 1, :]
-            local_rot = quat_mul_norm(quat_inverse(parent_global_rot), child_global_rot)
-            local_rotations_list.append(local_rot)
+    joint_positions = np.array(all_joint_positions)
+    print(f"[DEBUG] Joint Positions: {joint_positions.shape}")
+    print(f"[DEBUG] Root Translations: {root_translations.shape}")
+    print(f"[DEBUG] Joint Quaternion Angles: {rotations_quat.shape}")
+
+
+
+    # print(f"check")
+
+    return root_translations, rotations_quat
+
+
+def quaternion_to_euler(quaternion_data):
+    """
+    Converts a list of time frames containing quaternions to XYZ Euler angles.
+
+    Args:
+        quaternion_data (list of np.array): A list where each element is a NumPy
+                                            array representing a time frame. Each
+                                            array contains 32 float values
+                                            (8 joints * 4 quaternion components [w, x, y, z]).
+
+    Returns:
+        list of np.array: A list where each element is a NumPy array of Euler angles
+                          for a time frame. Each array will contain 24 float values
+                          (8 joints * 3 XYZ angles in radians).
+    """
+    euler_frames = []
+
+    # Iterate over each time frame in the input data
+    for frame_quaternions in quaternion_data:
+        # Reshape the flat array of 32 numbers into an 8x4 matrix (8 joints, 4 components each)
+        joints = frame_quaternions.reshape(1, 4)
+        
+        frame_euler_angles = []
+
+        # Iterate over each joint's quaternion
+        for q in joints:
+            w, x, y, z = q[0], q[1], q[2], q[3]
+
+            # singularity check for Pitch (gimbal lock)
+            # test for singularity at north pole
+            sinp = 2 * (w * y - z * x)
+            if np.abs(sinp) >= 1:
+                pitch = np.copysign(np.pi / 2, sinp) # use pi/2
+                
+                # gimbal lock case
+                roll = np.arctan2(x, w) * 2
+                yaw = 0
+            else:
+                # Pitch (y-axis rotation)
+                pitch = np.arcsin(sinp)
+                
+                # Roll (x-axis rotation)
+                sinr_cosp = 2 * (w * x + y * z)
+                cosr_cosp = 1 - 2 * (x**2 + y**2)
+                roll = np.arctan2(sinr_cosp, cosr_cosp)
+                
+                # Yaw (z-axis rotation)
+                siny_cosp = 2 * (w * z + x * y)
+                cosy_cosp = 1 - 2 * (y**2 + z**2)
+                yaw = np.arctan2(siny_cosp, cosy_cosp)
             
-    local_rotations_tensor = torch.stack(local_rotations_list, dim=1)
-    
-    print("[INFO] Applying Z-up coordinate system correction to root rotation.")
-    correction_quat = quat_from_angle_axis(
-        angle=torch.tensor(-180.0),
-        axis=torch.tensor([1.0, 0.0, 0.0]),
-        degree=True
-    )
-
-    root_rotations = local_rotations_tensor[:, 0, :]
-    corrected_root_rotations = quat_mul_norm(
-        correction_quat.expand_as(root_rotations),
-        root_rotations
-    )
-    local_rotations_tensor[:, 0, :] = corrected_root_rotations
-
-    skel_state = SkeletonState.from_rotation_and_root_translation(
-        skeleton_tree=skeleton_tree,
-        r=local_rotations_tensor,
-        t=root_translations_tensor,
-        is_local=True
-    )
-
-    skel_motion = SkeletonMotion.from_skeleton_state(skel_state, fps=fps)
-
-    return skel_motion
+            # Append the resulting XYZ Euler angles for the joint
+            frame_euler_angles.extend([roll, pitch, yaw])
+        
+        # Convert the list of Euler angles for the frame into a single NumPy array
+        # and add it to our list of processed frames
+        euler_frames.append(np.array(frame_euler_angles))
+        
+    return euler_frames
 
 
-# # CORRECT mapping from qpos indices to our skeleton joints
-    # mujoco_to_skeleton_mapping = {
-    #     # MuJoCo qpos[7:] order -> Skeleton joint index
-    #     'L_Hip': (0, 1),    # qpos[7:10] -> skeleton joint 1 (L_Hip)
-    #     'L_Knee': (3, 2),    # qpos[10:13] -> skeleton joint 2 (L_Knee)
-    #     'L_Ankle': (6, 3),   # qpos[13:16] -> skeleton joint 3 (L_Ankle)
-    #     'L_Toe': (9, 4),     # qpos[16:19] -> skeleton joint 4 (L_Toe)
-    #     'R_Hip': (12, 5),    # qpos[19:22] -> skeleton joint 5 (R_Hip)
-    #     'R_Knee': (15, 6),   # qpos[22:25] -> skeleton joint 6 (R_Knee)
-    #     'R_Ankle': (18, 7),  # qpos[25:28] -> skeleton joint 7 (R_Ankle)
-    #     'R_Toe': (21, 8),   # qpos[28:31] -> skeleton joint 8 (R_Toe)
-    # }
-    # Save the MuJoCo intermediate data for debugging
-    
-    # np.save('debug_mujoco_trans.npy', retargeted_trans)
-    # np.save('debug_mujoco_poses.npy', retargeted_poses)
+def euler_to_quaternion(rotation_data):
+    """
+    Converts a list of time frames containing XYZ Euler angles to quaternions.
+
+    Args:
+        rotation_data (list of np.array): A list where each element is a NumPy array
+                                           representing a time frame. Each array contains
+                                           24 float values (8 joints * 3 XYZ angles in radians).
+
+    Returns:
+        list of np.array: A list where each element is a NumPy array of quaternions
+                          for a time frame. Each array will contain 32 float values
+                          (8 joints * 4 quaternion components [w, x, y, z]).
+    """
+    quaternion_frames = []
+
+    # Iterate over each time frame in the input data
+    for frame_euler_angles in rotation_data:
+        # Reshape the flat array of 24 numbers into an 8x3 matrix (8 joints, 3 angles each)
+        joints = frame_euler_angles.reshape(8, 3)
+        
+        frame_quaternions = []
+
+        # Iterate over each joint's XYZ angles
+        for joint_angles in joints:
+            # Extract roll (x), pitch (y), and yaw (z) angles
+            roll, pitch, yaw = joint_angles[0], joint_angles[1], joint_angles[2]
+
+            # Calculate cosine and sine of half the angles
+            cr = np.cos(roll * 0.5)
+            sr = np.sin(roll * 0.5)
+            cp = np.cos(pitch * 0.5)
+            sp = np.sin(pitch * 0.5)
+            cy = np.cos(yaw * 0.5)
+            sy = np.sin(yaw * 0.5)
+
+            # Calculate quaternion components (w, x, y, z)
+            # This is the standard formula for XYZ Euler (Tait-Bryan) to quaternion conversion
+            w = cr * cp * cy + sr * sp * sy
+            x = sr * cp * cy - cr * sp * sy
+            y = cr * sp * cy + sr * cp * sy
+            z = cr * cp * sy - sr * sp * cy
+            
+            # Append the resulting quaternion for the joint
+            frame_quaternions.extend([ x, y, z, w])
+        
+        # Convert the list of quaternions for the frame into a single NumPy array
+        # and add it to our list of processed frames
+        quaternion_frames.append(np.array(frame_quaternions))
+        
+    return quaternion_frames
 
 
 def create_smpl_lower_body_skeleton_tree() -> SkeletonTree:
@@ -273,6 +369,46 @@ def create_smpl_lower_body_skeleton_tree() -> SkeletonTree:
 
     # Load directly; poselib's from_mjcf expects parent-local offsets.
     return SkeletonTree.from_mjcf(str(xml_path))
+
+def create_skeleton_motion_from_retargeted_data(
+    all_root_translations: np.ndarray,
+    rotations_quat: np.ndarray,
+    skeleton_tree: SkeletonTree,
+    fps: int
+) -> SkeletonMotion:
+    """
+    Converts retargeted motion data into a poselib.SkeletonMotion object.
+
+    Args:
+        all_root_translations (np.ndarray): Array of root translations for each frame.
+        rotations_quat (np.ndarray): Array of joint rotations (as quaternions) for each frame.
+        skeleton_tree (SkeletonTree): The skeleton tree for the character.
+        fps (int): The frames per second of the motion.
+
+    Returns:
+        SkeletonMotion: The resulting SkeletonMotion object.
+    """
+    # Convert numpy arrays to torch tensors
+    root_translations_tensor = torch.from_numpy(all_root_translations).float()
+    rotations_tensor = torch.from_numpy(rotations_quat).float()
+
+    # Create a SkeletonState object from the rotations and translations
+    # We assume the rotations from your IK solver are global rotations, so is_local=False
+    skeleton_state = SkeletonState.from_rotation_and_root_translation(
+        skeleton_tree=skeleton_tree,
+        r=rotations_tensor,
+        t=root_translations_tensor,
+        is_local=True  # Assuming global rotations from IK
+    )
+
+    # Convert the SkeletonState to a SkeletonMotion object
+    # This will also compute the joint velocities and angular velocities
+    skeleton_motion = SkeletonMotion.from_skeleton_state(
+        skeleton_state=skeleton_state,
+        fps=fps
+    )
+
+    return skeleton_motion
 
 
 def save_skeleton_motion(sk_motion: SkeletonMotion, output_path: str):
@@ -388,6 +524,8 @@ def main(
         help="Comma-separated joint names (default: Pelvis,L_Hip,L_Knee,L_Ankle,L_Toe,R_Hip,R_Knee,R_Ankle,R_Toe)"
     ),
     plot_angles: bool = typer.Option(False, "--plot", "-p", help="Plot sagittal plane angles after retargeting"),
+    plot_motion: bool = typer.Option(False, "--plot-motion", "-pm", help="Plot the final skeleton motion in a 3D viewer"),
+    plot_raw_motion: bool = typer.Option(False, "--plot-raw-motion", "-prm", help="Plot the raw skeleton motion in a 3D viewer before final processing"),
     plot_save_path: Optional[str] = typer.Option(None, "--plot-save", help="Path to save the angle plot (optional)"),
     render: bool = typer.Option(False, "--render", help="Render the retargeting process in a MuJoCo viewer.")
 ):
@@ -405,19 +543,23 @@ def main(
     try:
         print(f"Loading joint positions from {input_file}...")
         joint_positions = np.load(input_file)
+        
+        sk_tree = create_smpl_lower_body_skeleton_tree()
 
         print("[SUCCESS] Loaded motion data:")
         print(f"   - Shape: {joint_positions.shape}")
         print(f"   - Joint names: {joint_names_list}")
 
-        sk_tree = create_smpl_lower_body_skeleton_tree()
-
         if len(joint_names_list) != joint_positions.shape[1]:
             raise ValueError(f"Number of joint names ({len(joint_names_list)}) doesn't match number of joints in data ({joint_positions.shape[1]})")
 
         print("\n[RETARGET] Creating skeleton motion using mink for retargeting...")
-        sk_motion = retarget_motion_with_mink(
+        root_translations, rotations_quat = retarget_motion_with_mink(
             joint_positions, joint_names_list, sk_tree, fps=fps, render=render
+        )
+
+        sk_motion = create_skeleton_motion_from_retargeted_data(
+            root_translations, rotations_quat, sk_tree, fps=fps
         )
 
         print("\n[SAVE] Saving retargeted motion...")
