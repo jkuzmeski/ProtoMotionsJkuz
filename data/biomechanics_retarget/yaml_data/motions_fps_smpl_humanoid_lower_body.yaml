@@ -1,0 +1,37 @@
+motions:
+- file: D:/Isaac/IsaacLab2.1.2/ProtoMotions/data/biomechanics_retarget/retargeted_motions/S02_20ms_retargeted.npy
+  fps: 200.0
+  idx: 0
+  sub_motions:
+  - idx: 0
+    timings:
+      end: 7.57
+      start: 0.0
+    weight: 1.0
+- file: D:/Isaac/IsaacLab2.1.2/ProtoMotions/data/biomechanics_retarget/retargeted_motions/S02_30ms_retargeted.npy
+  fps: 200.0
+  idx: 1
+  sub_motions:
+  - idx: 1
+    timings:
+      end: 4.885
+      start: 0.0
+    weight: 1.0
+- file: D:/Isaac/IsaacLab2.1.2/ProtoMotions/data/biomechanics_retarget/retargeted_motions/S02_40ms_retargeted.npy
+  fps: 200.0
+  idx: 2
+  sub_motions:
+  - idx: 2
+    timings:
+      end: 6.47
+      start: 0.0
+    weight: 1.0
+- file: D:/Isaac/IsaacLab2.1.2/ProtoMotions/data/biomechanics_retarget/retargeted_motions/S02_50ms_retargeted.npy
+  fps: 200.0
+  idx: 3
+  sub_motions:
+  - idx: 3
+    timings:
+      end: 5.73
+      start: 0.0
+    weight: 1.0

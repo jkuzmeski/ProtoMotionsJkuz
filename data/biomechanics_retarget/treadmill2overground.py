@@ -45,6 +45,7 @@ JOINT_NAMES = [
 
 # --- Core Functions ---
 
+
 def parse_speed_from_filename(filename: str) -> Optional[float]:
     """
     Extracts treadmill speed from filename.
@@ -380,18 +381,24 @@ def save_motion_data(
 ):
     """
     Saves transformed joint centers to .npy, .txt, .csv, and .json formats.
+    The .npy file is saved to the main output path, while other files are saved to a metadata subfolder.
     """
     print(f"\n💾 Saving transformed motion data to '{output_path_base}.*'")
     output_path = Path(output_path_base)
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    # Create metadata subfolder
+    metadata_dir = output_path.parent / "metadata"
+    metadata_dir.mkdir(parents=True, exist_ok=True)
+    metadata_path_base = metadata_dir / output_path.name
 
     n_frames, n_joints, _ = joint_centers.shape
 
-    # --- Save as NPY (binary format) ---
+    # --- Save as NPY (binary format) to main output folder ---
     np.save(output_path.with_suffix(".npy"), joint_centers)
 
-    # --- Save as TXT (tab-separated values) ---
-    with open(output_path.with_suffix(".txt"), "w") as f:
+    # --- Save as TXT (tab-separated values) to metadata folder ---
+    with open(metadata_path_base.with_suffix(".txt"), "w") as f:
         f.write("# Transformed Motion Data\n")
         f.write(f"# Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
         f.write(f"# Joint Order: {', '.join(JOINT_NAMES)}\n")
@@ -401,7 +408,7 @@ def save_motion_data(
             # Prepend 1-based frame number.
             f.write(f"{i + 1}\t" + "\t".join(f"{x:.6f}" for x in row_data) + "\n")
 
-    # --- Save as CSV (for spreadsheets) ---
+    # --- Save as CSV (for spreadsheets) to metadata folder ---
     csv_columns = ["Frame"] + [
         f"{name}_{ax}" for name in JOINT_NAMES for ax in ["X", "Y", "Z"]
     ]
@@ -410,10 +417,10 @@ def save_motion_data(
         (np.arange(1, n_frames + 1)[:, np.newaxis], joint_centers.reshape(n_frames, -1))
     )
     pd.DataFrame(csv_data, columns=csv_columns).to_csv(
-        output_path.with_suffix(".csv"), index=False, float_format="%.6f"
+        metadata_path_base.with_suffix(".csv"), index=False, float_format="%.6f"
     )
 
-    # --- Save Metadata as JSON ---
+    # --- Save Metadata as JSON to metadata folder ---
     coord_system_desc = (
         "X=forward, Y=left, Z=up"
         if transform_applied == "y_to_x_forward"
@@ -429,10 +436,11 @@ def save_motion_data(
         "units": "meters",
         "coordinate_system": coord_system_desc,
     }
-    with open(output_path.with_suffix(".json"), "w") as f:
+    with open(metadata_path_base.with_suffix(".json"), "w") as f:
         json.dump(metadata, f, indent=4)
     
-    print("   - ✅ Saved .npy, .txt, .csv, and .json files.")
+    print("   - ✅ Saved .npy file to main output folder.")
+    print("   - ✅ Saved .txt, .csv, and .json files to metadata folder.")
 
 
 # --- Command-Line Interface ---
@@ -552,4 +560,4 @@ def main(
 
 
 if __name__ == "__main__":
-    typer.run(main)
+    typer.run(main) 

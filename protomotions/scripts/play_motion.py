@@ -3,10 +3,11 @@ import os
 
 
 def main(
+    motion_file: str,
     num_envs: int = 1,
     extra_args: str = "",
 ):
-    command = f"python protomotions/eval_agent.py +base=[fabric,structure] +exp=deepmimic_mlp +robot=smpl_humanoid_lower_body +simulator=isaaclab +checkpoint=null +training_max_steps=1 +motion_file=D:\\Isaac\\IsaacLab2.1.2\\ProtoMotions\\data\\motions\\retargeted_motion.npy env.config.sync_motion=True ref_respawn_offset=0 +headless=False num_envs={num_envs} {extra_args} +experiment_name=debug_fixed"
+    command = f"python protomotions/eval_agent.py +base=[fabric,structure] +exp=deepmimic_mlp +robot=smpl_humanoid_lower_body +simulator=isaaclab +checkpoint=null +training_max_steps=1 +motion_file={motion_file} env.config.sync_motion=True ref_respawn_offset=0 +headless=False num_envs={num_envs} {extra_args} +experiment_name=debug_fixed"
     os.system(command)
 
 
